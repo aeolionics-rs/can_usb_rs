@@ -1,0 +1,29 @@
+[package]
+name = "can_usb_kvaser"
+version = "0.1.0"
+edition = "2024"
+description = "Pure Rust driver for Kvaser USB CAN interfaces"
+license = "Apache-2.0"
+keywords = ["can", "usb", "kvaser"]
+repository = "https://github.com/aeolionics-rs/can_usb_rs.git"
+
+[features]
+default = ["async"]
+async = []
+
+[lib]
+# Disable doctest becuase the documentation examples may require hardware attached.
+doctest = false
+
+[dependencies]
+bytes = "1.12.1"
+can-hal-rs = { version = "0.4.2", features = ["async"] }
+deku = "0.20.3"
+futures = "0.3.34"
+nusb = { version = "0.2.7", features = ["tokio"] }
+tokio-util = { version = "0.7.19", features = ["codec"] }
+tracing = "0.1.44"
+
+[dev-dependencies]
+tracing-subscriber = "0.3.23"
+tokio = { version = "1.53.1", features = ["full"] }
