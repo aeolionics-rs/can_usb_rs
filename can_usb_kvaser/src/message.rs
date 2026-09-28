@@ -9,7 +9,18 @@ use deku::{DekuRead, DekuWrite};
 use std::fmt::{Display, Formatter};
 use std::time::{Duration, SystemTime};
 
-/// A EAN that identifies a specific product.
+/// Flags reported with received CAN messages.
+pub mod flags {
+    pub const ERROR_FRAME: u8 = 0x01;
+    pub const OVERRUN: u8 = 0x02;
+    pub const NERR: u8 = 0x04;
+    pub const WAKEUP: u8 = 0x08;
+    pub const REMOTE_FRAME: u8 = 0x10;
+    pub const TX_ACK: u8 = 0x40;
+    pub const TX_REQUEST: u8 = 0x80;
+}
+
+/// An EAN that identifies a specific product.
 pub struct Ean(pub u64);
 
 impl Display for Ean {
@@ -92,15 +103,62 @@ impl TransmitMessage {
     }
 }
 
+/// Representation of a CAN message received by the adapter.
+#[derive(Debug, DekuRead, DekuWrite)]
+pub struct ReceiveMessage {
+    channel: u8,
+    flags: u8,
+    #[deku(bytes = "6", endian = "little")]
+    timestamp: u64,
+    raw_data: [u8; 14],
+}
+
+impl ReceiveMessage {
+    /// Returns the channel the message was received on.
+    pub fn channel(&self) -> u8 {
+        self.channel
+    }
+
+    /// Returns the message [`flags`].
+    pub fn flags(&self) -> u8 {
+        self.flags
+    }
+
+    /// Returns the receive timestamp in adapter clock ticks.
+    pub fn timestamp(&self) -> u64 {
+        self.timestamp
+    }
+
+    /// Returns the identifier of a standard (11-bit) message.
+    pub fn standard_id(&self) -> u16 {
+        (self.raw_data[0] as u16 & 0x1f) << 6 | (self.raw_data[1] as u16 & 0x3f)
+    }
+
+    /// Returns the identifier of an extended (29-bit) message.
+    pub fn extended_id(&self) -> u32 {
+        (self.raw_data[0] as u32 & 0x1f) << 24 | (self.raw_data[1] as u32 & 0x3f) << 18 | (self.raw_data[2] as u32 & 0x0f) << 14 | (self.raw_data[3] as u32) << 6 | (self.raw_data[4] as u32 & 0x3f)
+    }
+
+    /// Returns the message data.
+    pub fn data(&self) -> &[u8] {
+        let len = (self.raw_data[5] & 0x0f).min(8) as usize;
+        &self.raw_data[6..6 + len]
+    }
+}
+
 /// A Kvaser USB message.
 ///
-/// Defintion of the messages in the vendor-specific interface definition.
+/// Definition of the messages in the vendor-specific interface definition.
 /// All USB devices use the same messages, although not all devices support all messages.
 #[derive(Debug, DekuRead, DekuWrite)]
 #[deku(id_type = "u8")]
 pub enum KvaserMessage {
+    #[deku(id = "0x0C")]
+    ReceiveStandard(ReceiveMessage),
     #[deku(id = "0x0D")]
     TransmitStandard(TransmitMessage),
+    #[deku(id = "0x0E")]
+    ReceiveExtended(ReceiveMessage),
     #[deku(id = "0x0F")]
     TransmitExtended(TransmitMessage),
     #[deku(id = "0x10")]
@@ -266,8 +324,13 @@ pub enum KvaserMessage {
     },
     #[deku(id = "0x31")]
     ResetErrorCounter { transaction: u8, channel: u8 },
-    // #[deku(id = "0x32")]
-    // TransmitAcknowledge,
+    #[deku(id = "0x32")]
+    TransmitAcknowledge {
+        channel: u8,
+        transaction: u8,
+        #[deku(read_all)]
+        data: Vec<u8>,
+    },
     #[deku(id = "0x33")]
     CanErrorEvent {
         transaction: u8,
@@ -305,4 +368,27 @@ pub enum KvaserMessage {
         #[deku(read_all)]
         data: Vec<u8>,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_receive_standard() {
+        let bytes = [0x0C, 0x00, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x04, 0x23, 0x00, 0x00, 0x00, 0x03, 0x01, 0x02, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let Ok(KvaserMessage::ReceiveStandard(msg)) = KvaserMessage::try_from(&bytes[..]) else { panic!("expected ReceiveStandard") };
+        assert_eq!(msg.standard_id(), 0x123);
+        assert_eq!(msg.data(), &[1, 2, 3]);
+        assert_eq!(msg.timestamp(), 0x060504030201);
+    }
+
+    #[test]
+    fn test_receive_extended() {
+        let bytes = [0x0E, 0x00, flags::REMOTE_FRAME, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x8D, 0x05, 0x08, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08];
+        let Ok(KvaserMessage::ReceiveExtended(msg)) = KvaserMessage::try_from(&bytes[..]) else { panic!("expected ReceiveExtended") };
+        assert_eq!(msg.extended_id(), 0x12345);
+        assert_eq!(msg.flags(), flags::REMOTE_FRAME);
+        assert_eq!(msg.data(), &[1, 2, 3, 4, 5, 6, 7, 8]);
+    }
 }

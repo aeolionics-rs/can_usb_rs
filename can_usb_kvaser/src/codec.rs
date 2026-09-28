@@ -2,7 +2,7 @@
 //
 //  SPDX-License-Identifier: Apache-2.0
 
-//! A Encoder and Decoder for Kvaser USB messages.
+//! An Encoder and Decoder for Kvaser USB messages.
 
 use crate::message::KvaserMessage;
 use bytes::{Buf, BufMut, BytesMut};
@@ -16,28 +16,36 @@ impl Decoder for KvaserCodec {
     type Item = KvaserMessage;
     type Error = std::io::Error;
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
-        // Skip zero padding the device adds to fill out the remainder of a USB packet.
-        let padding = src.iter().take_while(|&&b| b == 0).count();
-        src.advance(padding);
+        loop {
+            // Skip zero padding the device adds to fill out the remainder of a USB packet.
+            let padding = src.iter().take_while(|&&b| b == 0).count();
+            src.advance(padding);
+            if src.is_empty() {
+                return Ok(None);
+            }
 
-        // Check we have a header (length + control bytes)
-        if src.len() < 2 {
-            src.reserve(2);
-            return Ok(None);
-        }
+            // Have we received enough data yet?
+            let len = src[0] as usize;
+            if len > src.len() {
+                src.reserve(len - src.len());
+                return Ok(None);
+            }
+            let mut data = src.split_to(len);
+            data.advance(1); // Advance past the length byte.
+            if data.is_empty() {
+                tracing::warn!("Skipping message with no command");
+                continue;
+            }
+            tracing::debug!("Decoding: {:02X}", data);
 
-        // Have we received enough data yet?
-        let len = src[0] as usize;
-        if len > src.len() {
-            src.reserve(len - src.len());
-            return Ok(None);
+            // Return messages that fail to decode as unknown rather than an error, as errors terminate a FramedRead.
+            let message = KvaserMessage::try_from(data.as_ref()).unwrap_or_else(|e| {
+                tracing::warn!("Failed to decode message {:02X}: {}", data, e);
+                KvaserMessage::Unknown { command: data[0], data: data[1..].to_vec() }
+            });
+            tracing::debug!("Decoded: {:02X?}", message);
+            return Ok(Some(message));
         }
-        let mut data = src.split_to(len);
-        data.advance(1); // Advance past the length byte.
-        tracing::debug!("Decoding: {:02X}", data);
-        let message = KvaserMessage::try_from(data.as_ref())?;
-        tracing::debug!("Decoded: {:02X?}", message);
-        Ok(Some(message))
     }
 }
 
@@ -104,6 +112,16 @@ mod tests {
         assert!(matches!(codec.decode(&mut buf).unwrap(), Some(KvaserMessage::GetCardInfo { transaction: 0x12, level: 3 })));
         assert!(matches!(codec.decode(&mut buf).unwrap(), Some(KvaserMessage::GetCardInfo { transaction: 0x13, level: 1 })));
         assert!(codec.decode(&mut buf).unwrap().is_none());
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn test_decode_malformed() {
+        let mut codec = KvaserCodec {};
+        // A GetCardInfo command missing its level byte, then a length with no command.
+        let mut buf = BytesMut::from(&[3, 0x22, 0x12, 1, 4, 0x22, 0x13, 1][..]);
+        assert!(matches!(codec.decode(&mut buf).unwrap(), Some(KvaserMessage::Unknown { command: 0x22, .. })));
+        assert!(matches!(codec.decode(&mut buf).unwrap(), Some(KvaserMessage::GetCardInfo { transaction: 0x13, level: 1 })));
         assert!(buf.is_empty());
     }
 

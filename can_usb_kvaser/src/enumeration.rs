@@ -12,7 +12,7 @@ pub const KVASER_VID: u16 = 0x0bfd;
 ///
 /// Enumerating the devices may block. Devices are matched by vendor id.
 ///
-/// ```rust
+/// ```no_run
 /// #[tokio::main]
 /// async fn main() {
 ///     for device in can_usb_kvaser::list_devices().await.expect("Failed to list devices") {
