@@ -20,6 +20,14 @@ pub mod flags {
     pub const TX_REQUEST: u8 = 0x80;
 }
 
+/// Bus status reported in chip state and CAN error events.
+pub mod bus_status {
+    pub const BUS_RESET: u8 = 0x01;
+    pub const BUS_ERROR: u8 = 0x10;
+    pub const BUS_PASSIVE: u8 = 0x20;
+    pub const BUS_OFF: u8 = 0x40;
+}
+
 /// An EAN that identifies a specific product.
 pub struct Ean(pub u64);
 
@@ -100,6 +108,11 @@ impl TransmitMessage {
         raw_data[5] = len as u8;
         raw_data[6..6 + len].copy_from_slice(&data[0..len]);
         TransmitMessage { channel, transaction, raw_data, flags }
+    }
+
+    /// Returns the transaction id, which is returned in the [`KvaserMessage::TransmitAcknowledge`].
+    pub fn transaction(&self) -> u8 {
+        self.transaction
     }
 }
 

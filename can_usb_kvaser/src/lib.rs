@@ -62,6 +62,7 @@ use core::time::Duration;
 use futures::{Sink, SinkExt, Stream, StreamExt};
 use nusb::io::{EndpointRead, EndpointWrite};
 use nusb::transfer::{Bulk, In, Out};
+use std::collections::HashSet;
 use std::fmt::{Debug, Display, Formatter};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -229,25 +230,56 @@ type ReceiveResult = Result<Timestamped<CanFrame, u64>, Error>;
 /// Create flow-controlled transmit and receive channels, and the task that processes received messages.
 fn flow_controlled<Si, St>(sink: Si, stream: St, max_outstanding_tx: u16) -> (TransmitChannel<Si>, ReceiveChannel, impl Future<Output = ()> + Send + 'static)
 where
-    Si: Sink<KvaserMessage, Error = std::io::Error> + Unpin + Send,
+    Si: Sink<KvaserMessage, Error = std::io::Error> + Unpin + Send + 'static,
     St: Stream<Item = Result<KvaserMessage, std::io::Error>> + Unpin + Send + 'static,
 {
-    let permits = Arc::new(Semaphore::new(max_outstanding_tx.max(1) as usize));
+    // Transaction ids are a u8 so at most 256 messages can be distinguished.
+    let max_outstanding_tx = (max_outstanding_tx as usize).clamp(1, 256);
+    let transmitter = Arc::new(Transmitter {
+        sink: tokio::sync::Mutex::new(sink),
+        permits: Semaphore::new(max_outstanding_tx),
+        outstanding: std::sync::Mutex::new(Outstanding::default()),
+    });
     let (frames, received) = mpsc::channel(RECEIVE_QUEUE_LEN);
-    let task = process_received(stream, permits.clone(), frames);
-    (TransmitChannel { sink, permits }, ReceiveChannel(received), task)
+    let (transmit_open, transmit_closed) = mpsc::channel(1);
+    let task = process_received(stream, transmitter.clone(), frames, transmit_closed);
+    (TransmitChannel { transmitter, _open: transmit_open }, ReceiveChannel(received), task)
 }
 
-/// Process received messages, releasing a transmit permit for each acknowledgement and queuing frames for the [`ReceiveChannel`].
+/// Process received messages, handling acknowledgements and queuing frames for the [`ReceiveChannel`].
 ///
 /// Frames are dropped when the queue is full so that acknowledgements are still processed if the application is not receiving.
-async fn process_received<St>(mut stream: St, permits: Arc<Semaphore>, frames: mpsc::Sender<ReceiveResult>)
+/// Returns when the stream ends, or both channels have been dropped (`transmit_closed` completes when the [`TransmitChannel`] is dropped).
+async fn process_received<Si, St>(mut stream: St, transmitter: Arc<Transmitter<Si>>, frames: mpsc::Sender<ReceiveResult>, mut transmit_closed: mpsc::Receiver<()>)
 where
+    Si: Sink<KvaserMessage, Error = std::io::Error> + Unpin + Send,
     St: Stream<Item = Result<KvaserMessage, std::io::Error>> + Unpin,
 {
-    while let Some(result) = stream.next().await {
+    loop {
+        let result = tokio::select! {
+            result = stream.next() => match result {
+                Some(result) => result,
+                None => break,
+            },
+            _ = async {
+                frames.closed().await;
+                transmit_closed.recv().await
+            } => break,
+        };
         match result {
-            Ok(KvaserMessage::TransmitAcknowledge { .. }) => permits.add_permits(1),
+            Ok(KvaserMessage::TransmitAcknowledge { transaction, .. }) => transmitter.acknowledge(transaction),
+            Ok(KvaserMessage::ChipState { bus_status: status, .. } | KvaserMessage::CanErrorEvent { bus_status: status, .. }) if status & (bus_status::BUS_OFF | bus_status::BUS_RESET) != 0 => {
+                // Messages waiting to be sent will not be acknowledged, so discard them.
+                warn!("Bus off (status {:02X})", status);
+                if let Err(e) = transmitter.discard_outstanding().await {
+                    warn!("Failed to flush transmit queue: {}", e);
+                }
+            }
+            Ok(KvaserMessage::ChipStopped { .. }) => {
+                if let Err(e) = transmitter.discard_outstanding().await {
+                    warn!("Failed to flush transmit queue: {}", e);
+                }
+            }
             Ok(msg) => {
                 if let Some(frame) = received_frame(msg)
                     && let Err(TrySendError::Full(_)) = frames.try_send(Ok(frame))
@@ -262,31 +294,89 @@ where
         }
     }
     // No more acknowledgements will arrive, so fail any waiting transmits.
-    permits.close();
+    transmitter.permits.close();
+}
+
+/// Transaction ids of messages awaiting acknowledgement.
+#[derive(Default)]
+struct Outstanding {
+    transactions: HashSet<u8>,
+    next: u8,
+}
+
+impl Outstanding {
+    /// Allocate an unused transaction id.
+    fn allocate(&mut self) -> u8 {
+        while self.transactions.contains(&self.next) {
+            self.next = self.next.wrapping_add(1);
+        }
+        let transaction = self.next;
+        self.transactions.insert(transaction);
+        self.next = self.next.wrapping_add(1);
+        transaction
+    }
+}
+
+/// Transmit state shared between the [`TransmitChannel`] and the task processing received messages.
+struct Transmitter<Si> {
+    /// The sink, locked while sending so that flushing the device queue is ordered with transmits.
+    sink: tokio::sync::Mutex<Si>,
+    /// Limits the messages awaiting acknowledgement to the maximum the device supports.
+    permits: Semaphore,
+    outstanding: std::sync::Mutex<Outstanding>,
+}
+
+impl<Si: Sink<KvaserMessage, Error = std::io::Error> + Unpin + Send> Transmitter<Si> {
+    async fn transmit(&self, frame: &CanFrame) -> Result<(), Error> {
+        // Wait until the device can accept another message. The permit is returned when it is acknowledged.
+        self.permits.acquire().await.map_err(|_| Error::DeviceClosed)?.forget();
+        let mut sink = self.sink.lock().await;
+        let transaction = self.outstanding.lock().unwrap().allocate();
+        let msg = match frame.id() {
+            CanId::Standard(id) => KvaserMessage::TransmitStandard(TransmitMessage::standard(0, transaction, id, frame.data(), 0)),
+            CanId::Extended(id) => KvaserMessage::TransmitExtended(TransmitMessage::extended(0, transaction, id, frame.data(), 0)),
+        };
+        sink.send(msg).await.inspect_err(|_| self.acknowledge(transaction)).map_err(Into::into)
+    }
+
+    /// Release the permit for an acknowledged message. Acknowledgements for unknown transactions are ignored.
+    fn acknowledge(&self, transaction: u8) {
+        if self.outstanding.lock().unwrap().transactions.remove(&transaction) {
+            self.permits.add_permits(1);
+        }
+    }
+
+    /// Flush messages awaiting acknowledgement from the device and release their permits.
+    async fn discard_outstanding(&self) -> Result<(), Error> {
+        if self.outstanding.lock().unwrap().transactions.is_empty() {
+            return Ok(());
+        }
+        // Hold the sink so no transmit is sent between the flush and clearing the outstanding transactions.
+        let mut sink = self.sink.lock().await;
+        let result = sink.send(KvaserMessage::FlushQueue { transaction: 0, channel: 0, flags: 0 }).await;
+        let discarded = {
+            let mut outstanding = self.outstanding.lock().unwrap();
+            let discarded = outstanding.transactions.len();
+            outstanding.transactions.clear();
+            discarded
+        };
+        warn!("Discarded {} frames awaiting acknowledgement", discarded);
+        self.permits.add_permits(discarded);
+        result.map_err(Into::into)
+    }
 }
 
 struct TransmitChannel<Si> {
-    sink: Si,
-    permits: Arc<Semaphore>,
-}
-
-impl<Si: Sink<KvaserMessage, Error = std::io::Error> + Unpin + Send> TransmitChannel<Si> {
-    async fn transmit(&mut self, frame: &CanFrame) -> Result<(), Error> {
-        // Wait until the device can accept another message. The permit is returned when it is acknowledged.
-        self.permits.acquire().await.map_err(|_| Error::DeviceClosed)?.forget();
-        let msg = match frame.id() {
-            CanId::Standard(id) => KvaserMessage::TransmitStandard(TransmitMessage::standard(0, 0, id, frame.data(), 0)),
-            CanId::Extended(id) => KvaserMessage::TransmitExtended(TransmitMessage::extended(0, 0, id, frame.data(), 0)),
-        };
-        self.sink.send(msg).await.inspect_err(|_| self.permits.add_permits(1)).map_err(Into::into)
-    }
+    transmitter: Arc<Transmitter<Si>>,
+    /// Closed when the channel is dropped, so the task processing received messages can stop.
+    _open: mpsc::Sender<()>,
 }
 
 impl<Si: Sink<KvaserMessage, Error = std::io::Error> + Unpin + Send> AsyncTransmit for TransmitChannel<Si> {
     type Error = Error;
 
     fn transmit(&mut self, frame: &CanFrame) -> impl Future<Output = Result<(), Self::Error>> + Send {
-        self.transmit(frame)
+        self.transmitter.transmit(frame)
     }
 }
 
@@ -401,8 +491,20 @@ mod tests {
         (tx, rx, messages, sent)
     }
 
-    fn ack() -> Result<KvaserMessage, std::io::Error> {
-        Ok(KvaserMessage::TransmitAcknowledge { channel: 0, transaction: 0, data: vec![] })
+    fn ack(transaction: u8) -> Result<KvaserMessage, std::io::Error> {
+        Ok(KvaserMessage::TransmitAcknowledge { channel: 0, transaction, data: vec![] })
+    }
+
+    fn chip_state(bus_status: u8) -> Result<KvaserMessage, std::io::Error> {
+        Ok(KvaserMessage::ChipState { transaction: 0, channel: 0, timestamp: 0, tx_errors: 0, rx_errors: 0, bus_status })
+    }
+
+    /// Returns the transaction id of a transmitted message.
+    fn transaction(msg: Option<KvaserMessage>) -> u8 {
+        match msg {
+            Some(KvaserMessage::TransmitStandard(msg) | KvaserMessage::TransmitExtended(msg)) => msg.transaction(),
+            other => panic!("expected a transmit message, got {other:?}"),
+        }
     }
 
     const WAIT: Duration = Duration::from_millis(50);
@@ -415,11 +517,65 @@ mod tests {
         tx.transmit(&frame).await.unwrap();
         assert!(tokio::time::timeout(WAIT, tx.transmit(&frame)).await.is_err(), "third transmit should wait");
 
-        messages.unbounded_send(ack()).unwrap();
+        messages.unbounded_send(ack(0)).unwrap();
         tokio::time::timeout(WAIT, tx.transmit(&frame)).await.expect("transmit should proceed after acknowledge").unwrap();
 
+        let transactions: Vec<_> = sent.take(3).map(|msg| transaction(Some(msg))).collect().await;
+        assert_eq!(transactions, [0, 1, 2]);
+    }
+
+    #[tokio::test]
+    async fn test_dropping_channels_releases_device() {
+        let (tx, rx, _messages, sent) = test_channels(1);
+        drop(rx);
         drop(tx);
-        assert_eq!(sent.collect::<Vec<_>>().await.len(), 3);
+        // The sink is dropped once the task processing received messages stops.
+        let sent: Vec<_> = tokio::time::timeout(WAIT, sent.collect()).await.expect("task should stop when channels are dropped");
+        assert!(sent.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_unknown_and_duplicate_acknowledge_ignored() {
+        let (mut tx, _rx, messages, _sent) = test_channels(1);
+        let frame = CanFrame::new(CanId::Standard(0x123), b"data").unwrap();
+        tx.transmit(&frame).await.unwrap();
+        messages.unbounded_send(ack(5)).unwrap();
+        assert!(tokio::time::timeout(WAIT, tx.transmit(&frame)).await.is_err(), "unknown acknowledge should not release");
+
+        messages.unbounded_send(ack(0)).unwrap();
+        messages.unbounded_send(ack(0)).unwrap();
+        tokio::time::timeout(WAIT, tx.transmit(&frame)).await.unwrap().unwrap();
+        assert!(tokio::time::timeout(WAIT, tx.transmit(&frame)).await.is_err(), "duplicate acknowledge should not release");
+    }
+
+    #[tokio::test]
+    async fn test_bus_off_discards_outstanding() {
+        let (mut tx, _rx, messages, mut sent) = test_channels(1);
+        let frame = CanFrame::new(CanId::Standard(0x123), b"data").unwrap();
+        tx.transmit(&frame).await.unwrap();
+        assert_eq!(transaction(sent.next().await), 0);
+
+        // Error passive does not discard.
+        messages.unbounded_send(chip_state(bus_status::BUS_PASSIVE)).unwrap();
+        assert!(tokio::time::timeout(WAIT, tx.transmit(&frame)).await.is_err());
+
+        // Bus off flushes the device queue, then transmits can continue.
+        messages.unbounded_send(chip_state(bus_status::BUS_OFF)).unwrap();
+        tokio::time::timeout(WAIT, tx.transmit(&frame)).await.expect("transmit should proceed after bus off").unwrap();
+        assert!(matches!(sent.next().await, Some(KvaserMessage::FlushQueue { .. })));
+        assert_eq!(transaction(sent.next().await), 1);
+
+        // A late acknowledgement for the discarded message does not release a permit.
+        messages.unbounded_send(ack(0)).unwrap();
+        assert!(tokio::time::timeout(WAIT, tx.transmit(&frame)).await.is_err());
+    }
+
+    #[test]
+    fn test_allocate_skips_outstanding() {
+        let mut outstanding = Outstanding { transactions: HashSet::from([1, 2]), next: 255 };
+        assert_eq!(outstanding.allocate(), 255);
+        assert_eq!(outstanding.allocate(), 0);
+        assert_eq!(outstanding.allocate(), 3);
     }
 
     #[tokio::test]
@@ -430,7 +586,7 @@ mod tests {
         for _ in 0..RECEIVE_QUEUE_LEN + 10 {
             messages.unbounded_send(Ok(log_message(0, false, 0x123, 3))).unwrap();
         }
-        messages.unbounded_send(ack()).unwrap();
+        messages.unbounded_send(ack(0)).unwrap();
         tokio::time::timeout(WAIT, tx.transmit(&frame)).await.expect("transmit should proceed after acknowledge").unwrap();
 
         // The queue holds the frames received before it filled.
