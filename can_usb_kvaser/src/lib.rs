@@ -81,16 +81,27 @@ const RECEIVE_QUEUE_LEN: usize = 1024;
 /// CAN Errors, including wrapper for I/O and USB errors from dependencies.
 #[derive(Debug)]
 pub enum Error {
+    /// No matching device was found.
     DeviceNotFound,
+    /// The device did not respond to a request in time.
     Timeout,
+    /// The device has been closed or disconnected.
     DeviceClosed,
+    /// An I/O error communicating with the device.
     IoError(std::io::Error),
+    /// A USB error opening or configuring the device.
     UsbError(nusb::Error),
 }
 
 impl Display for Error {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}", self)
+        match self {
+            Error::DeviceNotFound => write!(f, "device not found"),
+            Error::Timeout => write!(f, "timed out waiting for the device to respond"),
+            Error::DeviceClosed => write!(f, "device closed"),
+            Error::IoError(e) => write!(f, "I/O error: {e}"),
+            Error::UsbError(e) => write!(f, "USB error: {e}"),
+        }
     }
 }
 
