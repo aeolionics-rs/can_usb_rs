@@ -270,8 +270,11 @@ pub enum KvaserMessage {
         options: u32,
         #[deku(endian = "little")]
         version: u32,
-        #[deku(pad_bytes_after = "6", endian = "little")]
+        #[deku(endian = "little")]
         max_outstanding_tx: u16,
+        /// Trailing reserved bytes, the length of which varies between firmware.
+        #[deku(read_all)]
+        reserved: Vec<u8>,
     },
     #[deku(id = "0x28")]
     GetBusLoad { transaction: u8, channel: u8 },

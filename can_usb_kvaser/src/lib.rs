@@ -10,6 +10,10 @@
 //! the [`AsyncTransmit`] and [`AsyncReceive`] traits from [`can_hal::async_channel`].
 //!
 //! # Futures
+//! The [`Sink`] and [`Stream`] implementations exchange raw [`KvaserMessage`]s and do not flow control
+//! transmission. Callers should keep no more than [`KvaserLeaf::max_outstanding_tx`] transmit messages
+//! awaiting a [`KvaserMessage::TransmitAcknowledge`].
+//!
 //! ```no_run
 //! # use can_usb_kvaser::KvaserLeaf;
 //! # use can_usb_kvaser::message::{KvaserMessage, TransmitMessage};
@@ -60,12 +64,18 @@ use nusb::io::{EndpointRead, EndpointWrite};
 use nusb::transfer::{Bulk, In, Out};
 use std::fmt::{Debug, Display, Formatter};
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
+use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::{Semaphore, mpsc};
 use tokio_util::codec::{FramedRead, FramedWrite};
 use tracing::{debug, warn};
 
 /// Time to wait for the device to respond to a request.
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Maximum number of received frames queued for the [`AsyncReceive`] channel.
+const RECEIVE_QUEUE_LEN: usize = 1024;
 
 /// CAN Errors, including wrapper for I/O and USB errors from dependencies.
 #[derive(Debug)]
@@ -101,6 +111,7 @@ impl core::error::Error for Error {}
 pub struct KvaserLeaf {
     sink: FramedWrite<EndpointWrite<Bulk>, KvaserCodec>,
     stream: FramedRead<EndpointRead<Bulk>, KvaserCodec>,
+    max_outstanding_tx: u16,
 }
 
 impl KvaserLeaf {
@@ -122,7 +133,15 @@ impl KvaserLeaf {
         let tx = interface.endpoint::<Bulk, Out>(0x02)?.writer(512).with_num_transfers(4);
         let sink = FramedWrite::new(tx, KvaserCodec {});
 
-        Ok(Self { sink, stream })
+        let mut leaf = Self { sink, stream, max_outstanding_tx: 0 };
+        let request = KvaserMessage::GetSoftwareInfo { transaction: 0x26, channel: 0 };
+        leaf.max_outstanding_tx = leaf
+            .request(request, |msg| match msg {
+                KvaserMessage::SoftwareInfo { max_outstanding_tx, .. } => Some(max_outstanding_tx),
+                _ => None,
+            })
+            .await?;
+        Ok(leaf)
     }
 
     /// Return information on the adapter, such as its model and serial number.
@@ -130,20 +149,30 @@ impl KvaserLeaf {
     /// Returns [`Error::Timeout`] if the device does not respond within one second.
     pub async fn card_info(&mut self) -> Result<CardInfo, Error> {
         let request = KvaserMessage::GetCardInfo { transaction: 0x22, level: 0 };
+        self.request(request, |msg| match msg {
+            KvaserMessage::CardInfo(info) => Some(info),
+            _ => None,
+        })
+        .await
+    }
+
+    /// The maximum number of transmit messages the device can have awaiting acknowledgement.
+    pub fn max_outstanding_tx(&self) -> u16 {
+        self.max_outstanding_tx
+    }
+
+    /// Send a request and wait for the first message accepted by `response`, skipping any others.
+    async fn request<T>(&mut self, request: KvaserMessage, mut response: impl FnMut(KvaserMessage) -> Option<T>) -> Result<T, Error> {
         self.sink.send(request).await?;
-        let response = async {
-            while let Some(response) = self.stream.next().await {
-                match response {
-                    Ok(KvaserMessage::CardInfo(info)) => {
-                        return Ok(info);
-                    }
-                    Ok(_) => continue,
-                    Err(e) => return Err(e.into()),
+        let wait = async {
+            while let Some(msg) = self.stream.next().await {
+                if let Some(value) = response(msg?) {
+                    return Ok(value);
                 }
             }
             Err(Error::DeviceClosed)
         };
-        tokio::time::timeout(RESPONSE_TIMEOUT, response).await.map_err(|_| Error::Timeout)?
+        tokio::time::timeout(RESPONSE_TIMEOUT, wait).await.map_err(|_| Error::Timeout)?
     }
 
     /// Set the CAN bus parameters.
@@ -173,8 +202,18 @@ impl KvaserLeaf {
     /// The receive timestamp is provided by the adapter hardware
     /// and is expressed in adapter clock ticks (e.g. 1/24MHz for a Leaf Light V2).
     /// It is **not tied** to Rust's monotonic system clock ([`std::time::Instant`]) and may drift.
+    ///
+    /// Transmission is flow controlled: [`AsyncTransmit::transmit`] waits while
+    /// [`max_outstanding_tx`](Self::max_outstanding_tx) messages are awaiting acknowledgement by the device.
+    /// A background task processes received messages so acknowledgements are handled even if the
+    /// receive channel is not polled. Up to 1024 received frames are queued, after which new frames are dropped.
+    ///
+    /// # Panics
+    /// Panics if called outside a Tokio runtime.
     pub fn channels(self) -> (impl AsyncTransmit<Error = Error>, impl AsyncReceive<Error = Error, Timestamp = u64>) {
-        (TransmitChannel(self.sink), ReceiveChannel(self.stream))
+        let (transmit, receive, task) = flow_controlled(self.sink, self.stream, self.max_outstanding_tx);
+        tokio::spawn(task);
+        (transmit, receive)
     }
 
     /// Return write and read USB endpoints for interacting with the device at a low level.
@@ -185,19 +224,65 @@ impl KvaserLeaf {
     }
 }
 
-struct TransmitChannel(FramedWrite<EndpointWrite<Bulk>, KvaserCodec>);
+type ReceiveResult = Result<Timestamped<CanFrame, u64>, Error>;
 
-impl TransmitChannel {
+/// Create flow-controlled transmit and receive channels, and the task that processes received messages.
+fn flow_controlled<Si, St>(sink: Si, stream: St, max_outstanding_tx: u16) -> (TransmitChannel<Si>, ReceiveChannel, impl Future<Output = ()> + Send + 'static)
+where
+    Si: Sink<KvaserMessage, Error = std::io::Error> + Unpin + Send,
+    St: Stream<Item = Result<KvaserMessage, std::io::Error>> + Unpin + Send + 'static,
+{
+    let permits = Arc::new(Semaphore::new(max_outstanding_tx.max(1) as usize));
+    let (frames, received) = mpsc::channel(RECEIVE_QUEUE_LEN);
+    let task = process_received(stream, permits.clone(), frames);
+    (TransmitChannel { sink, permits }, ReceiveChannel(received), task)
+}
+
+/// Process received messages, releasing a transmit permit for each acknowledgement and queuing frames for the [`ReceiveChannel`].
+///
+/// Frames are dropped when the queue is full so that acknowledgements are still processed if the application is not receiving.
+async fn process_received<St>(mut stream: St, permits: Arc<Semaphore>, frames: mpsc::Sender<ReceiveResult>)
+where
+    St: Stream<Item = Result<KvaserMessage, std::io::Error>> + Unpin,
+{
+    while let Some(result) = stream.next().await {
+        match result {
+            Ok(KvaserMessage::TransmitAcknowledge { .. }) => permits.add_permits(1),
+            Ok(msg) => {
+                if let Some(frame) = received_frame(msg)
+                    && let Err(TrySendError::Full(_)) = frames.try_send(Ok(frame))
+                {
+                    warn!("Receive queue full, dropping frame");
+                }
+            }
+            Err(e) => {
+                _ = frames.try_send(Err(e.into()));
+                break;
+            }
+        }
+    }
+    // No more acknowledgements will arrive, so fail any waiting transmits.
+    permits.close();
+}
+
+struct TransmitChannel<Si> {
+    sink: Si,
+    permits: Arc<Semaphore>,
+}
+
+impl<Si: Sink<KvaserMessage, Error = std::io::Error> + Unpin + Send> TransmitChannel<Si> {
     async fn transmit(&mut self, frame: &CanFrame) -> Result<(), Error> {
+        // Wait until the device can accept another message. The permit is returned when it is acknowledged.
+        self.permits.acquire().await.map_err(|_| Error::DeviceClosed)?.forget();
         let msg = match frame.id() {
             CanId::Standard(id) => KvaserMessage::TransmitStandard(TransmitMessage::standard(0, 0, id, frame.data(), 0)),
             CanId::Extended(id) => KvaserMessage::TransmitExtended(TransmitMessage::extended(0, 0, id, frame.data(), 0)),
         };
-        self.0.send(msg).await.map_err(Into::into)
+        self.sink.send(msg).await.inspect_err(|_| self.permits.add_permits(1)).map_err(Into::into)
     }
 }
 
-impl AsyncTransmit for TransmitChannel {
+impl<Si: Sink<KvaserMessage, Error = std::io::Error> + Unpin + Send> AsyncTransmit for TransmitChannel<Si> {
     type Error = Error;
 
     fn transmit(&mut self, frame: &CanFrame) -> impl Future<Output = Result<(), Self::Error>> + Send {
@@ -205,16 +290,11 @@ impl AsyncTransmit for TransmitChannel {
     }
 }
 
-struct ReceiveChannel(FramedRead<EndpointRead<Bulk>, KvaserCodec>);
+struct ReceiveChannel(mpsc::Receiver<ReceiveResult>);
 
 impl ReceiveChannel {
-    async fn receive(&mut self) -> Result<Timestamped<CanFrame, u64>, Error> {
-        while let Some(result) = self.0.next().await {
-            if let Some(frame) = received_frame(result?) {
-                return Ok(frame);
-            }
-        }
-        Err(Error::DeviceClosed)
+    async fn receive(&mut self) -> ReceiveResult {
+        self.0.recv().await.unwrap_or(Err(Error::DeviceClosed))
     }
 }
 
@@ -306,6 +386,72 @@ mod tests {
     fn test_received_frame_dlc_over_8() {
         let frame = received_frame(log_message(0, false, 0x123, 15)).unwrap();
         assert_eq!(frame.frame().data(), &[1, 2, 3, 4, 5, 6, 7, 8]);
+    }
+
+    type Messages = futures::channel::mpsc::UnboundedSender<Result<KvaserMessage, std::io::Error>>;
+
+    /// Create flow-controlled channels over in-memory queues, returning the channels,
+    /// a sender to inject received messages and a receiver for transmitted messages.
+    fn test_channels(max_outstanding_tx: u16) -> (impl AsyncTransmit<Error = Error>, ReceiveChannel, Messages, futures::channel::mpsc::UnboundedReceiver<KvaserMessage>) {
+        let (sink, sent) = futures::channel::mpsc::unbounded();
+        let sink = sink.sink_map_err(|_| std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+        let (messages, stream) = futures::channel::mpsc::unbounded();
+        let (tx, rx, task) = flow_controlled(sink, stream, max_outstanding_tx);
+        tokio::spawn(task);
+        (tx, rx, messages, sent)
+    }
+
+    fn ack() -> Result<KvaserMessage, std::io::Error> {
+        Ok(KvaserMessage::TransmitAcknowledge { channel: 0, transaction: 0, data: vec![] })
+    }
+
+    const WAIT: Duration = Duration::from_millis(50);
+
+    #[tokio::test]
+    async fn test_transmit_waits_for_acknowledge() {
+        let (mut tx, _rx, messages, sent) = test_channels(2);
+        let frame = CanFrame::new(CanId::Standard(0x123), b"data").unwrap();
+        tx.transmit(&frame).await.unwrap();
+        tx.transmit(&frame).await.unwrap();
+        assert!(tokio::time::timeout(WAIT, tx.transmit(&frame)).await.is_err(), "third transmit should wait");
+
+        messages.unbounded_send(ack()).unwrap();
+        tokio::time::timeout(WAIT, tx.transmit(&frame)).await.expect("transmit should proceed after acknowledge").unwrap();
+
+        drop(tx);
+        assert_eq!(sent.collect::<Vec<_>>().await.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_full_receive_queue_does_not_block_acknowledge() {
+        let (mut tx, mut rx, messages, _sent) = test_channels(1);
+        let frame = CanFrame::new(CanId::Standard(0x123), b"data").unwrap();
+        tx.transmit(&frame).await.unwrap();
+        for _ in 0..RECEIVE_QUEUE_LEN + 10 {
+            messages.unbounded_send(Ok(log_message(0, false, 0x123, 3))).unwrap();
+        }
+        messages.unbounded_send(ack()).unwrap();
+        tokio::time::timeout(WAIT, tx.transmit(&frame)).await.expect("transmit should proceed after acknowledge").unwrap();
+
+        // The queue holds the frames received before it filled.
+        drop(messages);
+        let mut received = 0;
+        while rx.receive().await.is_ok() {
+            received += 1;
+        }
+        assert_eq!(received, RECEIVE_QUEUE_LEN);
+    }
+
+    #[tokio::test]
+    async fn test_stream_end_closes_channels() {
+        let (mut tx, mut rx, messages, _sent) = test_channels(1);
+        let frame = CanFrame::new(CanId::Standard(0x123), b"data").unwrap();
+        tx.transmit(&frame).await.unwrap();
+        messages.unbounded_send(Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))).unwrap();
+
+        assert!(matches!(tokio::time::timeout(WAIT, tx.transmit(&frame)).await.unwrap(), Err(Error::DeviceClosed)));
+        assert!(matches!(rx.receive().await, Err(Error::IoError(_))));
+        assert!(matches!(rx.receive().await, Err(Error::DeviceClosed)));
     }
 
     #[test]
