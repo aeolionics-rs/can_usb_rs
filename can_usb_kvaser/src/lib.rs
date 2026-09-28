@@ -39,7 +39,6 @@ use can_hal::{CanFrame, CanId, Timestamped};
 use codec::KvaserCodec;
 use core::time::Duration;
 use futures::{Sink, SinkExt, Stream, StreamExt};
-use nusb::Interface;
 use nusb::io::{EndpointRead, EndpointWrite};
 use nusb::transfer::{Bulk, In, Out};
 use std::fmt::{Debug, Display, Formatter};
@@ -80,7 +79,6 @@ impl core::error::Error for Error {}
 
 /// Interface to a KvaserLeaf device.
 pub struct KvaserLeaf {
-    interface: Interface,
     sink: FramedWrite<EndpointWrite<Bulk>, KvaserCodec>,
     stream: FramedRead<EndpointRead<Bulk>, KvaserCodec>,
 }
@@ -104,7 +102,7 @@ impl KvaserLeaf {
         let tx = interface.endpoint::<Bulk, Out>(0x02)?.writer(512).with_num_transfers(4);
         let sink = FramedWrite::new(tx, KvaserCodec {});
 
-        Ok(Self { interface, sink, stream })
+        Ok(Self { sink, stream })
     }
 
     /// Return information on the adapter, such as its model and serial number.
@@ -154,11 +152,11 @@ impl KvaserLeaf {
         (TransmitChannel(self.sink), ReceiveChannel(self.stream))
     }
 
-    /// Return read and write USB endpoints for interacting with the device at a low level.
-    pub fn endpoints(self) -> Result<(EndpointWrite<Bulk>, EndpointRead<Bulk>), Error> {
-        let rx = self.interface.endpoint::<Bulk, In>(0x82)?.reader(512).with_num_transfers(4).with_read_timeout(Duration::from_millis(100));
-        let tx = self.interface.endpoint::<Bulk, Out>(0x02)?.writer(512).with_num_transfers(4);
-        Ok((tx, rx))
+    /// Return write and read USB endpoints for interacting with the device at a low level.
+    ///
+    /// Any data buffered by the codec (unsent writes or partially decoded reads) is discarded.
+    pub fn endpoints(self) -> (EndpointWrite<Bulk>, EndpointRead<Bulk>) {
+        (self.sink.into_inner(), self.stream.into_inner())
     }
 }
 

@@ -16,6 +16,10 @@ impl Decoder for KvaserCodec {
     type Item = KvaserMessage;
     type Error = std::io::Error;
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        // Skip zero padding the device adds to fill out the remainder of a USB packet.
+        let padding = src.iter().take_while(|&&b| b == 0).count();
+        src.advance(padding);
+
         // Check we have a header (length + control bytes)
         if src.len() < 2 {
             src.reserve(2);
@@ -91,5 +95,23 @@ mod tests {
         let msg = TransmitMessage::extended(0, 2, 0x12345, &[1, 2, 3, 4, 5, 6, 7, 8], 0x40);
         codec.encode(KvaserMessage::TransmitExtended(msg), &mut buf).unwrap();
         assert_eq!(buf.as_ref(), &[0x14, 0x0F, 0x00, 0x02, 0x00, 0x00, 0x04, 0x8D, 0x05, 0x08, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x00, 0x40]);
+    }
+
+    #[test]
+    fn test_decode_skips_padding() {
+        let mut codec = KvaserCodec {};
+        let mut buf = BytesMut::from(&[4, 0x22, 0x12, 3, 0, 0, 0, 0, 4, 0x22, 0x13, 1, 0, 0][..]);
+        assert!(matches!(codec.decode(&mut buf).unwrap(), Some(KvaserMessage::GetCardInfo { transaction: 0x12, level: 3 })));
+        assert!(matches!(codec.decode(&mut buf).unwrap(), Some(KvaserMessage::GetCardInfo { transaction: 0x13, level: 1 })));
+        assert!(codec.decode(&mut buf).unwrap().is_none());
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn test_decode_only_padding() {
+        let mut codec = KvaserCodec {};
+        let mut buf = BytesMut::from(&[0u8; 16][..]);
+        assert!(codec.decode(&mut buf).unwrap().is_none());
+        assert!(buf.is_empty());
     }
 }
