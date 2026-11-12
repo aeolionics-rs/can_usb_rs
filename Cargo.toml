@@ -1,5 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
-    "can_usb_kvaser"
+    "can_usb_gs",
+    "can_usb_kvaser",
+    "gs_usb_protocol",
 ]

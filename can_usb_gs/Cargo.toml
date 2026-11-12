@@ -1,0 +1,18 @@
+[package]
+name = "can_usb_gs"
+version = "0.1.0"
+edition = "2024"
+description = "Pure Rust driver for gs_usb (candleLight) USB CAN interfaces"
+license = "Apache-2.0"
+keywords = ["can", "usb", "gs_usb", "candlelight"]
+repository = "https://github.com/aeolionics-rs/can_usb_rs.git"
+
+[dependencies]
+gs_usb_protocol = { version = "0.1.0", path = "../gs_usb_protocol" }
+nusb = { version = "0.2.7", features = ["tokio"] }
+
+[dev-dependencies]
+tokio = { version = "1.53.1", features = ["macros", "rt"] }
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
