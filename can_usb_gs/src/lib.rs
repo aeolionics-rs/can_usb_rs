@@ -321,7 +321,9 @@ impl GsUsb {
     ///
     /// The request failing.
     pub async fn timestamp(&self) -> Result<u32, Error> {
-        Ok(decode_u32(&self.control_in(Request::Timestamp, 1, 4).await?)?)
+        // wValue names channel 0, as Linux sends it: some firmware (DSD's
+        // candleLight on the SH-C31G) stalls the request with 1.
+        Ok(decode_u32(&self.control_in(Request::Timestamp, 0, 4).await?)?)
     }
 
     /// Starts or stops the channel's identification (a blinking LED), for a
