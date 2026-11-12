@@ -12,7 +12,7 @@
 //! firmware is accepted and ignored, as candleLight does).
 //!
 //! This crate is the wire format only, for both sides: it encodes and decodes
-//! the structures, and has no dependencies.
+//! the structures, both ways, and has no dependencies.
 
 #![no_std]
 
@@ -27,6 +27,7 @@ pub const PRODUCT_ID: u16 = 0x606F;
 /// The vendor requests, in a SETUP packet's `bRequest`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
+#[repr(u8)]
 pub enum Request {
     /// OUT, a `u32`: the host's byte order (`0x0000_BEEF`), ignored.
     HostFormat,
@@ -62,6 +63,12 @@ pub enum Request {
 }
 
 impl Request {
+    /// Its `bRequest`.
+    #[must_use]
+    pub const fn code(self) -> u8 {
+        self as u8
+    }
+
     /// The request with this `bRequest`, if known.
     #[must_use]
     pub const fn from_u8(value: u8) -> Option<Self> {
@@ -85,6 +92,9 @@ impl Request {
         })
     }
 }
+
+/// [`Request::HostFormat`]'s value: little-endian.
+pub const HOST_FORMAT: u32 = 0x0000_BEEF;
 
 /// Feature bits, in [`BtConst::feature`]; the same bits ask for them in
 /// [`DeviceMode::flags`].
@@ -218,6 +228,14 @@ fn u32_at(bytes: &[u8], index: usize) -> Result<u32, DecodeError> {
     Ok(u32::from_le_bytes([word[0], word[1], word[2], word[3]]))
 }
 
+fn u32s<const N: usize>(bytes: &[u8]) -> Result<[u32; N], DecodeError> {
+    let mut words = [0; N];
+    for (index, word) in words.iter_mut().enumerate() {
+        *word = u32_at(bytes, index)?;
+    }
+    Ok(words)
+}
+
 fn put_u32s<const N: usize>(words: [u32; N], out: &mut [u8]) -> &[u8] {
     for (chunk, word) in out.as_chunks_mut::<4>().0.iter_mut().zip(words) {
         chunk.copy_from_slice(&word.to_le_bytes());
@@ -254,6 +272,11 @@ impl DeviceMode {
             flags: u32_at(bytes, 1)?,
         })
     }
+
+    /// Its 8 bytes, written into `out` (at least 8 long).
+    pub fn encode<'a>(&self, out: &'a mut [u8]) -> &'a [u8] {
+        put_u32s([self.mode, self.flags], out)
+    }
 }
 
 /// [`Request::Bittiming`]: a bit's timing in quanta, as Linux computes it.
@@ -286,6 +309,11 @@ impl DeviceBittiming {
             brp: u32_at(bytes, 4)?,
         })
     }
+
+    /// Its 20 bytes, written into `out` (at least 20 long).
+    pub fn encode<'a>(&self, out: &'a mut [u8]) -> &'a [u8] {
+        put_u32s([self.prop_seg, self.phase_seg1, self.phase_seg2, self.sjw, self.brp], out)
+    }
 }
 
 /// [`Request::DeviceConfig`]: how many channels, and versions.
@@ -306,6 +334,20 @@ impl DeviceConfig {
         out[4..8].copy_from_slice(&self.sw_version.to_le_bytes());
         out[8..12].copy_from_slice(&self.hw_version.to_le_bytes());
         &out[..12]
+    }
+
+    /// From the request's data.
+    ///
+    /// # Errors
+    ///
+    /// [`DecodeError::Short`] for fewer than 12 bytes.
+    pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
+        let [first, sw_version, hw_version] = u32s(bytes)?;
+        Ok(Self {
+            icount: first.to_le_bytes()[3],
+            sw_version,
+            hw_version,
+        })
     }
 }
 
@@ -335,6 +377,27 @@ impl BtConst {
             out,
         )
     }
+
+    /// From the request's data.
+    ///
+    /// # Errors
+    ///
+    /// [`DecodeError::Short`] for fewer than 40 bytes.
+    pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
+        let [feature, fclk_can, tseg1_min, tseg1_max, tseg2_min, tseg2_max, sjw_max, brp_min, brp_max, brp_inc] = u32s(bytes)?;
+        Ok(Self {
+            feature,
+            fclk_can,
+            tseg1_min,
+            tseg1_max,
+            tseg2_min,
+            tseg2_max,
+            sjw_max,
+            brp_min,
+            brp_max,
+            brp_inc,
+        })
+    }
 }
 
 /// [`Request::BtConstExt`]: [`BtConst`] followed by the ranges of the data
@@ -360,6 +423,27 @@ impl BtConstExt {
         put_u32s([self.dtseg1_min, self.dtseg1_max, self.dtseg2_min, self.dtseg2_max, self.dsjw_max, self.dbrp_min, self.dbrp_max, self.dbrp_inc], &mut out[40..]);
         &out[..72]
     }
+
+    /// From the request's data.
+    ///
+    /// # Errors
+    ///
+    /// [`DecodeError::Short`] for fewer than 72 bytes.
+    pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
+        let nominal = BtConst::decode(bytes)?;
+        let [dtseg1_min, dtseg1_max, dtseg2_min, dtseg2_max, dsjw_max, dbrp_min, dbrp_max, dbrp_inc] = u32s(bytes.get(40..).ok_or(DecodeError::Short)?)?;
+        Ok(Self {
+            nominal,
+            dtseg1_min,
+            dtseg1_max,
+            dtseg2_min,
+            dtseg2_max,
+            dsjw_max,
+            dbrp_min,
+            dbrp_max,
+            dbrp_inc,
+        })
+    }
 }
 
 /// [`Request::Identify`]'s mode.
@@ -378,6 +462,11 @@ pub mod identify {
 /// [`DecodeError::Short`] for fewer than 4 bytes.
 pub fn decode_u32(bytes: &[u8]) -> Result<u32, DecodeError> {
     u32_at(bytes, 0)
+}
+
+/// A request's single `u32`, written into `out` (at least 4 long).
+pub fn encode_u32(value: u32, out: &mut [u8]) -> &[u8] {
+    put_u32s([value], out)
 }
 
 /// [`DeviceState::state`]'s values.
@@ -411,6 +500,16 @@ impl DeviceState {
     /// Its 12 bytes, written into `out` (at least 12 long).
     pub fn encode<'a>(&self, out: &'a mut [u8]) -> &'a [u8] {
         put_u32s([self.state, self.rxerr, self.txerr], out)
+    }
+
+    /// From the request's data.
+    ///
+    /// # Errors
+    ///
+    /// [`DecodeError::Short`] for fewer than 12 bytes.
+    pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
+        let [state, rxerr, txerr] = u32s(bytes)?;
+        Ok(Self { state, rxerr, txerr })
     }
 }
 
@@ -504,6 +603,30 @@ impl HostFrame {
             data,
             timestamp_us: None,
         })
+    }
+
+    /// Decodes a frame from the device (IN): received from the bus or the
+    /// echo of one the host sent. A classic frame needs [`CLASSIC_LEN`] bytes
+    /// and an FD frame [`FD_LEN`], four more each when `timestamped` (the
+    /// channel was started with [`feature::HW_TIMESTAMP`]); the timestamp
+    /// follows all eight or 64 data bytes, whatever the DLC. Any bytes beyond
+    /// are ignored, as padding to the packet size
+    /// ([`feature::PAD_PKTS_TO_MAX_PKT_SIZE`]) adds.
+    ///
+    /// # Errors
+    ///
+    /// [`DecodeError::Short`] for too few bytes and [`DecodeError::Dlc`] for a
+    /// DLC over 15.
+    pub fn decode_in(bytes: &[u8], timestamped: bool) -> Result<Self, DecodeError> {
+        let mut frame = Self::decode(bytes)?;
+        let end = HEADER_LEN + if frame.is_fd() { 64 } else { 8 };
+        if bytes.len() < end {
+            return Err(DecodeError::Short);
+        }
+        if timestamped {
+            frame.timestamp_us = Some(u32_at(bytes.get(end..).ok_or(DecodeError::Short)?, 0)?);
+        }
+        Ok(frame)
     }
 
     /// Encodes the frame into `out` (at least [`FD_TS_LEN`] long, or
@@ -613,6 +736,97 @@ mod tests {
         assert!(!decoded.is_fd());
         assert_eq!(decoded.encode(&mut buf).len(), CLASSIC_LEN);
         assert_eq!(fd_len(13), 32);
+    }
+
+    #[test]
+    fn frames_from_the_device() {
+        let mut buf = [0; FD_TS_LEN];
+        let classic = HostFrame {
+            echo_id: ECHO_ID_RX,
+            can_id: 0x123,
+            can_dlc: 2,
+            channel: 0,
+            flags: 0,
+            data: data(&[1, 2]),
+            timestamp_us: Some(0x0102_0304),
+        };
+        let bytes = classic.encode(&mut buf).to_vec();
+        assert_eq!(HostFrame::decode_in(&bytes, true), Ok(classic));
+        assert_eq!(HostFrame::decode_in(&bytes[..CLASSIC_LEN], false), Ok(HostFrame { timestamp_us: None, ..classic }));
+        assert_eq!(HostFrame::decode_in(&bytes[..CLASSIC_LEN], true), Err(DecodeError::Short));
+        // Padded to a 64-byte packet.
+        let mut padded = [0; 64];
+        padded[..CLASSIC_TS_LEN].copy_from_slice(&bytes);
+        assert_eq!(HostFrame::decode_in(&padded, true), Ok(classic));
+        // An FD frame's timestamp follows all 64 data bytes, even at DLC 9.
+        let fd = HostFrame {
+            echo_id: 4,
+            can_dlc: 9,
+            flags: frame_flag::FD,
+            data: data(&[7; 12]),
+            ..classic
+        };
+        let bytes = fd.encode(&mut buf).to_vec();
+        assert_eq!(bytes.len(), FD_TS_LEN);
+        assert_eq!(HostFrame::decode_in(&bytes, true), Ok(fd));
+        assert_eq!(HostFrame::decode_in(&bytes[..HEADER_LEN + 12], false), Err(DecodeError::Short));
+    }
+
+    #[test]
+    fn host_side_round_trips() {
+        let mut buf = [0; 72];
+        let mode = DeviceMode {
+            mode: mode::START,
+            flags: feature::FD | feature::HW_TIMESTAMP,
+        };
+        assert_eq!(DeviceMode::decode(mode.encode(&mut buf)), Ok(mode));
+        let timing = DeviceBittiming {
+            prop_seg: 1,
+            phase_seg1: 12,
+            phase_seg2: 2,
+            sjw: 1,
+            brp: 6,
+        };
+        assert_eq!(DeviceBittiming::decode(timing.encode(&mut buf)), Ok(timing));
+        let config = DeviceConfig { icount: 1, sw_version: 2, hw_version: 3 };
+        assert_eq!(DeviceConfig::decode(config.encode(&mut buf)), Ok(config));
+        assert_eq!(DeviceConfig::decode(&[0; 11]), Err(DecodeError::Short));
+        let state = DeviceState {
+            state: state::ERROR_PASSIVE,
+            rxerr: 130,
+            txerr: 8,
+        };
+        assert_eq!(DeviceState::decode(state.encode(&mut buf)), Ok(state));
+        let nominal = BtConst {
+            feature: feature::FD | feature::BT_CONST_EXT,
+            fclk_can: 80_000_000,
+            tseg1_min: 1,
+            tseg1_max: 256,
+            tseg2_min: 1,
+            tseg2_max: 128,
+            sjw_max: 128,
+            brp_min: 1,
+            brp_max: 512,
+            brp_inc: 1,
+        };
+        assert_eq!(BtConst::decode(nominal.encode(&mut buf)), Ok(nominal));
+        assert_eq!(BtConst::decode(&[0; 39]), Err(DecodeError::Short));
+        let ext = BtConstExt {
+            nominal,
+            dtseg1_min: 1,
+            dtseg1_max: 32,
+            dtseg2_min: 1,
+            dtseg2_max: 16,
+            dsjw_max: 16,
+            dbrp_min: 1,
+            dbrp_max: 32,
+            dbrp_inc: 1,
+        };
+        assert_eq!(BtConstExt::decode(ext.encode(&mut buf)), Ok(ext));
+        assert_eq!(BtConstExt::decode(&buf[..71]), Err(DecodeError::Short));
+        assert_eq!(encode_u32(HOST_FORMAT, &mut buf), &[0xEF, 0xBE, 0, 0]);
+        assert_eq!(Request::GetState.code(), 14);
+        assert_eq!(Request::from_u8(Request::BtConstExt.code()), Some(Request::BtConstExt));
     }
 
     #[test]
