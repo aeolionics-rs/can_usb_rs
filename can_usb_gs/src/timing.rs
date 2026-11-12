@@ -40,6 +40,10 @@ impl Limits {
     }
 }
 
+/// How far, in per mille, a sample point may be from the one asked for and
+/// still be taken for having more quanta.
+pub(crate) const TOLERANCE: u64 = 10;
+
 /// The timing for exactly `bitrate` from a `clock_hz` controller clock, with
 /// the sample point (in per mille) nearest `sample_point`, or `None` if no
 /// prescaler divides the clock to that rate within `limits`.
@@ -50,10 +54,9 @@ impl Limits {
 /// phase 1 as Linux does (propagation half, rounded down), and the
 /// synchronisation jump width is Linux's default: half of phase 2, at least
 /// 1, no more than phase 1 or the device allows.
-/// How far, in per mille, a sample point may be from the one asked for and
-/// still be taken for having more quanta.
-pub(crate) const TOLERANCE: u64 = 10;
-
+///
+/// A sample point exactly between two quanta is taken at the earlier one, as
+/// Linux does, so that this driver and Linux's agree on a shared bus.
 pub(crate) fn solve(clock_hz: u32, bitrate: u32, sample_point: u16, limits: &Limits) -> Option<DeviceBittiming> {
     if bitrate == 0 {
         return None;
@@ -103,8 +106,8 @@ fn split(quanta: u32, sample_point: u64, limits: &Limits) -> Option<(u32, u32)> 
     if quanta < 1 + tseg1_min + tseg2_min || quanta > 1 + tseg1_max + tseg2_max {
         return None;
     }
-    // The quanta up to the sample point, rounded to nearest.
-    let before = u32::try_from((u64::from(quanta) * sample_point + 500) / 1000).ok()?;
+    // The quanta up to the sample point, rounded to nearest, halves down.
+    let before = u32::try_from((u64::from(quanta) * sample_point + 499) / 1000).ok()?;
     let tseg1 = before.saturating_sub(1).clamp(tseg1_min, tseg1_max);
     let tseg2 = (quanta - 1 - tseg1).clamp(tseg2_min, tseg2_max);
     let tseg1 = quanta - 1 - tseg2;
@@ -210,6 +213,12 @@ mod tests {
         // 5 Mbit/s: 34 quanta at brp 1, 79.4%.
         let fast = solve(170_000_000, 5_000_000, 800, &FDCAN_DATA).unwrap();
         assert_eq!((fast.brp, quanta(&fast), per_mille(&fast)), (1, 34, 794));
+        // 5 Mbit/s at 75%: 25.5 of 34 quanta, a tie, taken at 25 (73.5%), as
+        // Linux chose for the SH-C31G on the same bus (dprop-seg 12,
+        // dphase-seg1 12, dphase-seg2 9, dsjw 4).
+        let linux = solve(170_000_000, 5_000_000, 750, &FDCAN_DATA).unwrap();
+        assert_eq!((linux.brp, quanta(&linux), per_mille(&linux)), (1, 34, 735));
+        assert_eq!((linux.prop_seg, linux.phase_seg1, linux.phase_seg2, linux.sjw), (12, 12, 9, 4));
     }
 
     #[test]
