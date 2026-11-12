@@ -10,7 +10,7 @@ use core::pin::Pin;
 use core::task::{Context, Poll};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use can_hal::async_channel::{AsyncReceive, AsyncReceiveFd, AsyncTransmit, AsyncTransmitFd};
 use can_hal::{BusState, BusStatus, CanFdFrame, CanFrame, CanId, ErrorCounters, Frame, SamplePoint, Timestamped};
@@ -32,6 +32,10 @@ const RECEIVE_QUEUE_LEN: usize = 1024;
 
 /// How many bulk IN transfers are kept submitted.
 const IN_TRANSFERS: usize = 8;
+
+/// How long bulk IN must stay quiet, after a reset, for what came to be all
+/// the device had queued from before.
+const DRAIN_QUIET: Duration = Duration::from_millis(20);
 
 /// How a channel is to be started.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -355,6 +359,38 @@ pub(crate) fn halves(interface: &Interface, index: u16, channel: u8, endpoints: 
         },
         Receiver { events: receiver, shared, _guard: guard },
     ))
+}
+
+/// Reads and drops what the device had queued for the host before a reset:
+/// echoes and error frames from an earlier session that ended without
+/// reading them (its process killed, say), which would otherwise come first
+/// in the next, an old echo settling a new frame's slot. Done once bulk IN
+/// stays quiet for [`DRAIN_QUIET`]. If the endpoint can't be claimed (a
+/// started channel holds it) nothing is dropped.
+pub(crate) async fn drain_in(interface: &Interface, endpoint: u8) {
+    let Ok(mut bulk_in) = interface.endpoint::<Bulk, In>(endpoint) else { return };
+    let packet = bulk_in.max_packet_size();
+    let len = FD_TS_LEN.div_ceil(packet) * packet;
+    bulk_in.submit(Buffer::new(len));
+    loop {
+        match tokio::time::timeout(DRAIN_QUIET, bulk_in.next_complete()).await {
+            Ok(completion) if completion.status.is_ok() => {
+                debug!("gs_usb: dropped {} bytes queued before the reset", completion.buffer.len());
+                let mut buffer = completion.buffer;
+                buffer.clear();
+                buffer.set_requested_len(len);
+                bulk_in.submit(buffer);
+            }
+            Ok(_) => return,
+            Err(_) => {
+                bulk_in.cancel_all();
+                while bulk_in.pending() > 0 {
+                    let _ = bulk_in.next_complete().await;
+                }
+                return;
+            }
+        }
+    }
 }
 
 /// Extends the device's 32-bit microsecond timer.

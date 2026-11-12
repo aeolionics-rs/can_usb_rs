@@ -11,7 +11,7 @@ repository = "https://github.com/aeolionics-rs/can_usb_rs.git"
 can-hal-rs = { version = "0.4.3", features = ["async"] }
 gs_usb_protocol = { version = "0.1.0", path = "../gs_usb_protocol" }
 nusb = { version = "0.2.7", features = ["tokio"] }
-tokio = { version = "1.53.1", features = ["rt", "sync"] }
+tokio = { version = "1.53.1", features = ["rt", "sync", "time"] }
 tracing = "0.1.44"
 
 [dev-dependencies]

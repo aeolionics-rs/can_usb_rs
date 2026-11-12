@@ -376,8 +376,10 @@ impl GsUsb {
             }
             None => None,
         };
-        // Stop it first, in case an earlier session left it running.
+        // Stop it first, in case an earlier session left it running, and
+        // drop what that session left unread.
         self.mode(channel, mode::RESET, 0).await?;
+        channel::drain_in(&self.interface, self.bulk_in).await;
         let mut buf = [0; 20];
         self.control_out(Request::Bittiming, channel.into(), nominal.encode(&mut buf)).await?;
         if let Some(data) = data {
