@@ -2,38 +2,156 @@
 //
 //  SPDX-License-Identifier: Apache-2.0
 
-//! Starts the first `gs_usb` device that opens (others may be in use; with a
-//! data bit rate, the first with CAN FD) at a bit rate, sends some frames,
-//! waiting for each one's echo, and prints what it receives.
+//! Starts the first `gs_usb` device that opens (others may be in use; with
+//! `--fd`, the first with CAN FD), sends some frames, waiting for each one's
+//! echo, and prints what it receives, error frames decoded.
 //!
-//! `cargo run --example bus -- [bitrate] [count] [listen seconds] [data
-//! bitrate]`, by default 250000, 10, 5 and none. Frames are standard ID 0x123
-//! with a counter in the data. With a data bit rate (sampled at 75%, as Linux
-//! does above 800 kbit/s) the channel is CAN FD and the frames are FD with
-//! bit rate switching, cycling through the FD lengths, 0 to 64 bytes.
+//! ```text
+//! cargo run --example bus -- [--bitrate 250000] [--count 10] [--listen 5]
+//!     [--fd <data bitrate>] [--one-shot] [--listen-only] [--bus-errors]
+//! ```
+//!
+//! Frames are standard ID 0x123 with a counter in the data, sampled at 87.5%.
+//! With `--fd` (the data phase sampled at 75%, as Linux does above
+//! 800 kbit/s) they are FD with bit rate switching, cycling through the FD
+//! lengths, 0 to 64 bytes.
 
 use std::time::Duration;
 
 use can_hal::{BusStatus, CanFdFrame, CanFrame, CanId, Frame, SamplePoint};
-use can_usb_gs::protocol::feature;
-use can_usb_gs::{Event, GsUsb, Settings, list_devices};
+use can_usb_gs::protocol::{can_err, feature};
+use can_usb_gs::{ErrorFrame, Event, GsUsb, Receiver, Settings, list_devices};
 
 /// The FD data lengths, one per DLC.
 const FD_LENGTHS: [usize; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 20, 24, 32, 48, 64];
 
+struct Options {
+    bitrate: u32,
+    count: u32,
+    listen: u64,
+    data_bitrate: Option<u32>,
+    one_shot: bool,
+    listen_only: bool,
+    bus_errors: bool,
+}
+
+fn options() -> Options {
+    let mut options = Options {
+        bitrate: 250_000,
+        count: 10,
+        listen: 5,
+        data_bitrate: None,
+        one_shot: false,
+        listen_only: false,
+        bus_errors: false,
+    };
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        let mut number = || args.next().and_then(|value| value.parse::<u32>().ok()).unwrap_or_else(|| panic!("{arg} needs a number"));
+        match arg.as_str() {
+            "--bitrate" => options.bitrate = number(),
+            "--count" => options.count = number(),
+            "--listen" => options.listen = number().into(),
+            "--fd" => options.data_bitrate = Some(number()),
+            "--one-shot" => options.one_shot = true,
+            "--listen-only" => options.listen_only = true,
+            "--bus-errors" => options.bus_errors = true,
+            _ => panic!("unknown option {arg}"),
+        }
+    }
+    options
+}
+
+/// An error frame in words, as Linux's `candump -e` would put it.
+fn describe(error: &ErrorFrame) -> String {
+    let names = [
+        (can_err::LOSTARB, "lost-arbitration"),
+        (can_err::CRTL, "controller"),
+        (can_err::PROT, "protocol"),
+        (can_err::ACK, "no-ack"),
+        (can_err::BUSOFF, "bus-off"),
+        (can_err::BUSERROR, "bus-error"),
+        (can_err::RESTARTED, "restarted"),
+        (can_err::CNT, "counters"),
+    ];
+    let mut words: Vec<String> = names.iter().filter(|(bit, _)| error.class & bit != 0).map(|(_, name)| (*name).to_string()).collect();
+    if error.class & can_err::CRTL != 0 {
+        let crtl = [
+            (can_err::crtl::RX_OVERFLOW, "rx-overflow"),
+            (can_err::crtl::RX_WARNING, "rx-warning"),
+            (can_err::crtl::TX_WARNING, "tx-warning"),
+            (can_err::crtl::RX_PASSIVE, "rx-passive"),
+            (can_err::crtl::TX_PASSIVE, "tx-passive"),
+            (can_err::crtl::ACTIVE, "active"),
+        ];
+        let set: Vec<&str> = crtl.iter().filter(|(bit, _)| error.data[1] & bit != 0).map(|(_, name)| *name).collect();
+        words.push(format!("[{}]", set.join(" ")));
+    }
+    if error.class & can_err::PROT != 0 {
+        let prot = [(can_err::prot::FORM, "form"), (can_err::prot::STUFF, "stuff"), (can_err::prot::BIT0, "bit0"), (can_err::prot::BIT1, "bit1")];
+        let set: Vec<&str> = prot.iter().filter(|(bit, _)| error.data[2] & bit != 0).map(|(_, name)| *name).collect();
+        words.push(format!("[{} at {:#04x}]", set.join(" "), error.data[3]));
+    }
+    if error.class & can_err::CNT != 0 {
+        words.push(format!("tx {} rx {}", error.data[6], error.data[7]));
+    }
+    words.join(" ")
+}
+
+/// Prints what `rx` receives for `listen` seconds and a second more.
+async fn receive(mut rx: Receiver, listen: u64) -> Receiver {
+    let (mut frames, mut errors) = (0u32, 0u32);
+    let deadline = tokio::time::sleep(Duration::from_secs(listen + 1));
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            event = rx.next_event() => match event {
+                Ok(Event::Received(received)) => {
+                    frames += 1;
+                    let micros = received.timestamp().device_micros();
+                    match received.frame() {
+                        Frame::Can(frame) => println!("rx {:?} {:02X?} at {micros:?} µs", frame.id(), frame.data()),
+                        Frame::Fd(frame) => println!(
+                            "rx FD{}{} {:?} [{}] {:02X?} at {micros:?} µs",
+                            if frame.brs() { " BRS" } else { "" },
+                            if frame.esi() { " ESI" } else { "" },
+                            frame.id(),
+                            frame.len(),
+                            frame.data()
+                        ),
+                    }
+                }
+                Ok(Event::Error(error)) => {
+                    errors += 1;
+                    println!("error {} at {:?} µs; bus {:?}", describe(&error), error.timestamp.device_micros(), rx.bus_state());
+                }
+                Ok(other) => println!("rx {other:?}"),
+                Err(e) => {
+                    println!("rx ended: {e}");
+                    break;
+                }
+            },
+            () = &mut deadline => break,
+        }
+    }
+    println!(
+        "received {frames} frame(s), {errors} error frame(s); {} dropped, {} overflowed; bus {:?} {:?}",
+        rx.dropped(),
+        rx.overflows(),
+        rx.bus_state(),
+        rx.error_counters()
+    );
+    rx
+}
+
 #[tokio::main]
 async fn main() -> Result<(), can_usb_gs::Error> {
-    let mut args = std::env::args().skip(1).map(|arg| arg.parse::<u32>().expect("a number"));
-    let bitrate = args.next().unwrap_or(250_000);
-    let count = args.next().unwrap_or(10);
-    let listen = args.next().unwrap_or(5);
-    let data_bitrate = args.next();
-
+    let options = options();
     let mut device = None;
     for info in list_devices().await? {
         let name = info.to_string();
         match GsUsb::open(info).await {
-            Ok(opened) if data_bitrate.is_some() && opened.bt_const(0).await?.feature & feature::FD == 0 => println!("{name}: no CAN FD"),
+            Ok(opened) if options.data_bitrate.is_some() && opened.bt_const(0).await?.feature & feature::FD == 0 => println!("{name}: no CAN FD"),
             Ok(opened) => {
                 println!("{name}");
                 device = Some(opened);
@@ -43,57 +161,46 @@ async fn main() -> Result<(), can_usb_gs::Error> {
         }
     }
     let device = device.expect("no gs_usb device could be opened");
-    let mut settings = Settings::new(bitrate).with_sample_point(SamplePoint::PCT_87_5);
-    if let Some(data_bitrate) = data_bitrate {
+    let mut settings = Settings::new(options.bitrate).with_sample_point(SamplePoint::PCT_87_5);
+    if let Some(data_bitrate) = options.data_bitrate {
         settings = settings.with_data_sample_point(data_bitrate, SamplePoint::PCT_75);
     }
-    let (mut tx, mut rx) = device.start(0, &settings).await?;
-    println!("started at {bitrate} bit/s, data {data_bitrate:?}");
+    if options.one_shot {
+        settings = settings.one_shot();
+    }
+    if options.listen_only {
+        settings = settings.listen_only();
+    }
+    if options.bus_errors {
+        settings = settings.bus_errors();
+    }
+    let (mut tx, rx) = device.start(0, &settings).await?;
+    println!("started at {} bit/s, data {:?}", options.bitrate, options.data_bitrate);
 
-    let receiving = tokio::spawn(async move {
-        let mut frames = 0u32;
-        let deadline = tokio::time::sleep(Duration::from_secs(u64::from(listen) + 1));
-        tokio::pin!(deadline);
-        loop {
-            tokio::select! {
-                event = rx.next_event() => match event {
-                    Ok(Event::Received(received)) => {
-                        frames += 1;
-                        let micros = received.timestamp().device_micros();
-                        match received.frame() {
-                            Frame::Can(frame) => println!("rx {:?} {:02X?} at {micros:?} µs", frame.id(), frame.data()),
-                            Frame::Fd(frame) => println!("rx FD{}{} {:?} [{}] {:02X?} at {micros:?} µs", if frame.brs() { " BRS" } else { "" }, if frame.esi() { " ESI" } else { "" }, frame.id(), frame.len(), frame.data()),
-                        }
-                    }
-                    Ok(other) => println!("rx {other:?}"),
-                    Err(e) => {
-                        println!("rx ended: {e}");
-                        break;
-                    }
-                },
-                () = &mut deadline => break,
-            }
-        }
-        println!("received {frames} frame(s); {} dropped, {} overflowed; bus {:?} {:?}", rx.dropped(), rx.overflows(), rx.bus_state(), rx.error_counters());
-        rx
-    });
+    let receiving = tokio::spawn(receive(rx, options.listen));
 
     let id = CanId::new_standard(0x123).expect("11 bits");
     let mut previous = None;
-    for n in 0..count {
-        let frame = if data_bitrate.is_some() {
+    for n in 0..options.count {
+        let frame = if options.data_bitrate.is_some() {
             let len = FD_LENGTHS[n as usize % FD_LENGTHS.len()];
             let data: Vec<u8> = (0..len).map(|i| n.to_le_bytes()[0].wrapping_add(i.to_le_bytes()[0])).collect();
             Frame::Fd(CanFdFrame::new(id, &data, true, false).expect("an FD length"))
         } else {
             Frame::Can(CanFrame::new(id, &n.to_be_bytes()).expect("4 bytes"))
         };
-        let confirmation = tx.send(&frame).await?;
+        let confirmation = match tx.send(&frame).await {
+            Ok(confirmation) => confirmation,
+            Err(e) => {
+                println!("tx {n}: {e}");
+                continue;
+            }
+        };
         match tokio::time::timeout(Duration::from_secs(1), confirmation).await {
             Ok(Ok(timestamp)) => {
                 let micros = timestamp.device_micros();
                 let gap = micros.zip(previous).map(|(now, then): (u64, u64)| now - then);
-                println!("tx {n} sent at {micros:?} µs (+{gap:?})");
+                println!("tx {n} echoed at {micros:?} µs (+{gap:?}); bus {:?}", tx.bus_state());
                 previous = micros;
             }
             Ok(Err(e)) => println!("tx {n}: {e}"),
