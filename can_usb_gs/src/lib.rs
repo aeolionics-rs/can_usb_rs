@@ -8,23 +8,36 @@
 //! the kernel's `gs_usb` driver owns these devices and `SocketCAN` is the
 //! usual way in.
 //!
-//! So far: finding devices, opening one, and its control requests (the
-//! device's configuration, timing limits, state and timer).
+//! [`GsUsb::start`] starts a channel and returns its two halves, which
+//! implement can-hal's async traits: a [`Transmitter`] (each frame's echo
+//! and its timestamp come back as a [`Confirmation`]: the time on the bus or
+//! the time queued, as the firmware decides) and a
+//! [`Receiver`] (frames, remote frames and error frames as [`Event`]s, and
+//! the bus state they report). It needs a tokio runtime.
 //!
 //! ```no_run
+//! # use can_hal::{AsyncReceive, AsyncTransmit, CanFrame, CanId, SamplePoint};
 //! # async fn example() -> Result<(), can_usb_gs::Error> {
-//! for info in can_usb_gs::list_devices().await? {
-//!     let device = can_usb_gs::GsUsb::open(info).await?;
-//!     println!("{} channel(s)", device.config().channels());
-//! }
+//! let info = can_usb_gs::list_devices().await?.next().expect("a device");
+//! let device = can_usb_gs::GsUsb::open(info).await?;
+//! let settings = can_usb_gs::Settings::new(250_000).with_sample_point(SamplePoint::PCT_87_5);
+//! let (mut tx, mut rx) = device.start(0, &settings).await?;
+//! tx.transmit(&CanFrame::new(CanId::new_standard(0x123).unwrap(), b"data").unwrap()).await?;
+//! let received = rx.receive().await?;
+//! println!("{:?} at {:?}", received.frame(), received.timestamp().device_micros());
 //! # Ok(())
 //! # }
 //! ```
 
+mod channel;
+mod timing;
+
+pub use channel::{Confirmation, ECHO_SLOTS, ErrorFrame, Event, Receiver, Settings, Timestamp, Transmitter};
+
 use core::time::Duration;
 use std::fmt::{Display, Formatter};
 
-use gs_usb_protocol::{BtConst, BtConstExt, DecodeError, DeviceConfig, DeviceState, Request, decode_u32, encode_u32};
+use gs_usb_protocol::{BtConst, BtConstExt, DecodeError, DeviceBittiming, DeviceConfig, DeviceMode, DeviceState, Request, decode_u32, encode_u32, feature, mode};
 use nusb::Interface;
 use nusb::descriptors::TransferType;
 use nusb::transfer::{ControlIn, ControlOut, ControlType, Direction, Recipient, TransferError};
@@ -39,7 +52,7 @@ pub const DEVICE_IDS: &[(u16, u16)] = &[(0x1D50, 0x606F), (0x1209, 0x2323), (0x1
 const VENDOR_CLASS: u8 = 0xFF;
 
 /// Time to wait for the device to answer a control request.
-const CONTROL_TIMEOUT: Duration = Duration::from_secs(1);
+pub(crate) const CONTROL_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// What went wrong.
 #[derive(Debug)]
@@ -59,6 +72,15 @@ pub enum Error {
     NoChannel(u8),
     /// The device lacks a feature this request needs.
     Unsupported(u32),
+    /// No timing within the device's limits gives this bit rate exactly
+    /// from its clock.
+    Timing(u32),
+    /// An FD frame on a channel started without CAN FD.
+    NotFd,
+    /// A frame to send on a listen-only channel.
+    ListenOnly,
+    /// The channel stopped or the device went away.
+    Stopped,
 }
 
 impl Display for Error {
@@ -70,6 +92,10 @@ impl Display for Error {
             Error::NoInterface => write!(f, "no gs_usb interface"),
             Error::NoChannel(channel) => write!(f, "no channel {channel}"),
             Error::Unsupported(feature) => write!(f, "the device lacks feature {feature:#x}"),
+            Error::Timing(bitrate) => write!(f, "no bit timing gives {bitrate} bit/s"),
+            Error::NotFd => write!(f, "an FD frame on a classic channel"),
+            Error::ListenOnly => write!(f, "a frame to send on a listen-only channel"),
+            Error::Stopped => write!(f, "the channel stopped"),
         }
     }
 }
@@ -266,7 +292,7 @@ impl GsUsb {
     }
 
     /// The channel's timing limits including the CAN FD data phase, for a
-    /// device with [`feature::BT_CONST_EXT`](gs_usb_protocol::feature::BT_CONST_EXT).
+    /// device with [`feature::BT_CONST_EXT`].
     ///
     /// # Errors
     ///
@@ -278,7 +304,7 @@ impl GsUsb {
     }
 
     /// The channel's bus state and error counters, for a device with
-    /// [`feature::GET_STATE`](gs_usb_protocol::feature::GET_STATE).
+    /// [`feature::GET_STATE`].
     ///
     /// # Errors
     ///
@@ -299,7 +325,7 @@ impl GsUsb {
     }
 
     /// Starts or stops the channel's identification (a blinking LED), for a
-    /// device with [`feature::IDENTIFY`](gs_usb_protocol::feature::IDENTIFY).
+    /// device with [`feature::IDENTIFY`].
     ///
     /// # Errors
     ///
@@ -310,6 +336,59 @@ impl GsUsb {
         self.require(channel, gs_usb_protocol::feature::IDENTIFY).await?;
         let mut buf = [0; 4];
         self.control_out(Request::Identify, channel.into(), encode_u32(if on { ON } else { OFF }, &mut buf)).await
+    }
+
+    /// Starts `channel` with `settings` and returns its two halves; dropping
+    /// both stops it. The device's timestamps are asked for when it has
+    /// them.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Unsupported`] for a setting the device lacks (CAN FD needs
+    /// [`feature::FD`] and [`feature::BT_CONST_EXT`]), [`Error::Timing`] for
+    /// a bit rate its clock can't make, [`Error::Usb`] if the channel is
+    /// already started, or a request failing.
+    pub async fn start(&self, channel: u8, settings: &Settings) -> Result<(Transmitter, Receiver), Error> {
+        let bt = self.bt_const(channel).await?;
+        let has = |wanted: u32| bt.feature & wanted == wanted;
+        let mut flags = bt.feature & feature::HW_TIMESTAMP;
+        for (asked, wanted) in [
+            (settings.listen_only, feature::LISTEN_ONLY),
+            (settings.loopback, feature::LOOP_BACK),
+            (settings.one_shot, feature::ONE_SHOT),
+            (settings.bus_errors, feature::BERR_REPORTING),
+            (settings.data.is_some(), feature::FD | feature::BT_CONST_EXT),
+        ] {
+            if asked {
+                if !has(wanted) {
+                    return Err(Error::Unsupported(wanted & !bt.feature));
+                }
+                flags |= wanted & !feature::BT_CONST_EXT;
+            }
+        }
+        let nominal = timing::solve(bt.fclk_can, settings.bitrate, settings.sample_point.per_mille(), &timing::Limits::nominal(&bt)).ok_or(Error::Timing(settings.bitrate))?;
+        let data = match settings.data {
+            Some((bitrate, sample_point)) => {
+                let ext = self.bt_const_ext(channel).await?;
+                Some(timing::solve(bt.fclk_can, bitrate, sample_point.per_mille(), &timing::Limits::data(&ext)).ok_or(Error::Timing(bitrate))?)
+            }
+            None => None,
+        };
+        // Stop it first, in case an earlier session left it running.
+        self.mode(channel, mode::RESET, 0).await?;
+        let mut buf = [0; 20];
+        self.control_out(Request::Bittiming, channel.into(), nominal.encode(&mut buf)).await?;
+        if let Some(data) = data {
+            self.control_out(Request::DataBittiming, channel.into(), DeviceBittiming::encode(&data, &mut buf)).await?;
+        }
+        let halves = channel::halves(&self.interface, self.number.into(), channel, (self.bulk_in, self.bulk_out), settings, flags & feature::HW_TIMESTAMP != 0)?;
+        self.mode(channel, mode::START, flags).await?;
+        Ok(halves)
+    }
+
+    async fn mode(&self, channel: u8, mode: u32, flags: u32) -> Result<(), Error> {
+        let mut buf = [0; 8];
+        self.control_out(Request::Mode, channel.into(), DeviceMode { mode, flags }.encode(&mut buf)).await
     }
 
     fn check_channel(&self, channel: u8) -> Result<(), Error> {
@@ -333,14 +412,18 @@ impl GsUsb {
     }
 
     async fn control_out(&self, request: Request, value: u16, data: &[u8]) -> Result<(), Error> {
-        let data = ControlOut {
-            control_type: ControlType::Vendor,
-            recipient: Recipient::Interface,
-            request: request.code(),
-            value,
-            index: self.number.into(),
-            data,
-        };
-        Ok(self.interface.control_out(data, CONTROL_TIMEOUT).await?)
+        Ok(self.interface.control_out(control_out_request(request, value, self.number.into(), data), CONTROL_TIMEOUT).await?)
+    }
+}
+
+/// A vendor request to the `gs_usb` interface, `index`.
+pub(crate) fn control_out_request(request: Request, value: u16, index: u16, data: &[u8]) -> ControlOut<'_> {
+    ControlOut {
+        control_type: ControlType::Vendor,
+        recipient: Recipient::Interface,
+        request: request.code(),
+        value,
+        index,
+        data,
     }
 }
