@@ -172,7 +172,8 @@ pub enum Event {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum TxFailure {
-    /// Given up after a single-shot attempt failed.
+    /// Given up after a single-shot attempt failed, the device not saying
+    /// why.
     GaveUp,
     /// Dropped on going bus-off.
     BusOff,
@@ -180,6 +181,11 @@ pub enum TxFailure {
     Aborted,
     /// The controller's report was lost: it may have been sent.
     Unconfirmed,
+    /// Given up after a single-shot attempt lost arbitration.
+    LostArbitration,
+    /// Given up after a single-shot attempt failed on an error (no
+    /// acknowledgement, say).
+    TxError,
     /// A reason this driver doesn't know.
     Other(u8),
 }
@@ -191,6 +197,8 @@ impl TxFailure {
             tx_failed::BUS_OFF => Self::BusOff,
             tx_failed::ABORTED => Self::Aborted,
             tx_failed::UNCONFIRMED => Self::Unconfirmed,
+            tx_failed::LOST_ARBITRATION => Self::LostArbitration,
+            tx_failed::TX_ERROR => Self::TxError,
             other => Self::Other(other),
         }
     }
@@ -203,6 +211,8 @@ impl std::fmt::Display for TxFailure {
             Self::BusOff => write!(f, "dropped on going bus-off"),
             Self::Aborted => write!(f, "aborted"),
             Self::Unconfirmed => write!(f, "its report was lost; it may have been sent"),
+            Self::LostArbitration => write!(f, "lost arbitration on its single-shot attempt"),
+            Self::TxError => write!(f, "an error on its single-shot attempt"),
             Self::Other(code) => write!(f, "reason {code}"),
         }
     }

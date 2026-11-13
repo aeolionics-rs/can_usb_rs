@@ -157,7 +157,8 @@ pub mod frame_flag {
 /// Why a frame was not sent, in `data[0]` of an echo flagged
 /// [`frame_flag::TX_FAILED`].
 pub mod tx_failed {
-    /// Given up after a single-shot attempt failed.
+    /// Given up after a single-shot attempt failed, the controller not saying
+    /// why ([`LOST_ARBITRATION`] and [`TX_ERROR`] when it does).
     pub const GAVE_UP: u8 = 1;
     /// Dropped on going bus-off.
     pub const BUS_OFF: u8 = 2;
@@ -166,6 +167,11 @@ pub mod tx_failed {
     /// The controller's report of the transmission was lost: it may have
     /// been sent.
     pub const UNCONFIRMED: u8 = 4;
+    /// Given up after a single-shot attempt lost arbitration.
+    pub const LOST_ARBITRATION: u8 = 5;
+    /// Given up after a single-shot attempt failed on an error (no
+    /// acknowledgement, say).
+    pub const TX_ERROR: u8 = 6;
 }
 
 /// Flags in [`HostFrame::can_id`], as in Linux's `struct can_frame`.
