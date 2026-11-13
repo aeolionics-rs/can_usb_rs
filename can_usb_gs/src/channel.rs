@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use can_hal::async_channel::{AsyncReceive, AsyncReceiveFd, AsyncTransmit, AsyncTransmitFd};
 use can_hal::{BusState, BusStatus, CanFdFrame, CanFrame, CanId, ErrorCounters, Frame, SamplePoint, Timestamped};
-use gs_usb_protocol::{ECHO_ID_RX, FD_TS_LEN, HostFrame, can_err, can_id, fd_len, feature, frame_flag, tx_failed};
+use gs_usb_protocol::{ECHO_ID_RX, FD_TS_LEN, HostFrame, Request, can_err, can_id, encode_u32, fd_len, feature, frame_flag, tx_failed};
 use nusb::transfer::{Buffer, Bulk, In, Out, TransferError};
 use nusb::{Endpoint, Interface, MaybeFuture};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
@@ -177,8 +177,10 @@ pub enum TxFailure {
     GaveUp,
     /// Dropped on going bus-off.
     BusOff,
-    /// Aborted.
+    /// Aborted ([`Transmitter::abort`]) before its transmission started.
     Aborted,
+    /// Aborted, but the device can't say whether it was sent first.
+    AbortedUnconfirmed,
     /// The controller's report was lost: it may have been sent.
     Unconfirmed,
     /// Given up after a single-shot attempt lost arbitration.
@@ -196,6 +198,7 @@ impl TxFailure {
             tx_failed::GAVE_UP => Self::GaveUp,
             tx_failed::BUS_OFF => Self::BusOff,
             tx_failed::ABORTED => Self::Aborted,
+            tx_failed::ABORTED_UNCONFIRMED => Self::AbortedUnconfirmed,
             tx_failed::UNCONFIRMED => Self::Unconfirmed,
             tx_failed::LOST_ARBITRATION => Self::LostArbitration,
             tx_failed::TX_ERROR => Self::TxError,
@@ -210,6 +213,7 @@ impl std::fmt::Display for TxFailure {
             Self::GaveUp => write!(f, "given up after a single-shot attempt"),
             Self::BusOff => write!(f, "dropped on going bus-off"),
             Self::Aborted => write!(f, "aborted"),
+            Self::AbortedUnconfirmed => write!(f, "aborted; it may have been sent"),
             Self::Unconfirmed => write!(f, "its report was lost; it may have been sent"),
             Self::LostArbitration => write!(f, "lost arbitration on its single-shot attempt"),
             Self::TxError => write!(f, "an error on its single-shot attempt"),
@@ -218,10 +222,28 @@ impl std::fmt::Display for TxFailure {
     }
 }
 
-/// A frame sent and not yet echoed.
+/// A frame sent and not yet echoed. Its permit holds the slot; while an
+/// abort of it is being asked for, the slot stays held after the echo, so
+/// that no other frame takes its `echo_id` before the device has the
+/// request.
 struct Slot {
     _permit: OwnedSemaphorePermit,
-    done: oneshot::Sender<Result<Timestamp, TxFailure>>,
+    /// Which frame: one sent after it may take the slot once it is free.
+    seq: u64,
+    /// Taken by its echo.
+    done: Option<oneshot::Sender<Result<Timestamp, TxFailure>>>,
+    aborting: bool,
+}
+
+impl Slot {
+    fn new(permit: OwnedSemaphorePermit, seq: u64, done: oneshot::Sender<Result<Timestamp, TxFailure>>) -> Self {
+        Self {
+            _permit: permit,
+            seq,
+            done: Some(done),
+            aborting: false,
+        }
+    }
 }
 
 /// What the reader, [`Transmitter`] and [`Receiver`] share.
@@ -232,6 +254,8 @@ struct Shared {
     slots: Mutex<Vec<Option<Slot>>>,
     dropped: AtomicU64,
     overflows: AtomicU64,
+    /// The frames sent so far, to tell one slot's frames apart.
+    sent: AtomicU64,
     /// Whether the channel was started with transmit confirmation, so that
     /// echoes say when a frame wasn't sent.
     tx_confirmation: bool,
@@ -245,6 +269,7 @@ impl Shared {
             slots: Mutex::new((0..ECHO_SLOTS).map(|_| None).collect()),
             dropped: AtomicU64::new(0),
             overflows: AtomicU64::new(0),
+            sent: AtomicU64::new(0),
             tx_confirmation,
         }
     }
@@ -289,7 +314,8 @@ pub struct Transmitter {
     fd: bool,
     listen_only: bool,
     shared: Arc<Shared>,
-    _guard: Arc<Guard>,
+    /// Keeps the channel started; and the interface, for aborts.
+    guard: Arc<Guard>,
 }
 
 /// A frame's echo, which resolves with the echo's [`Timestamp`].
@@ -306,17 +332,22 @@ pub struct Transmitter {
 /// Until it is echoed the frame holds one of the [`ECHO_SLOTS`]. A frame that
 /// can't get onto the bus (no other node acknowledges it, or it keeps losing
 /// arbitration) is retried by the controller and not echoed, so this can wait
-/// indefinitely: time it out if that matters. The `gs_usb` protocol has no
-/// request to take back one frame; only a mode reset (stopping the channel)
-/// drops them, all at once.
+/// indefinitely: time it out if that matters, and withdraw it with
+/// [`Transmitter::abort`] on a device with transmit confirmation. The
+/// `gs_usb` protocol itself has no request to take back one frame; only a
+/// mode reset (stopping the channel) drops them, all at once.
 #[must_use = "a confirmation does nothing unless awaited"]
-pub struct Confirmation(oneshot::Receiver<Result<Timestamp, TxFailure>>);
+pub struct Confirmation {
+    receiver: oneshot::Receiver<Result<Timestamp, TxFailure>>,
+    echo_id: u32,
+    seq: u64,
+}
 
 impl Future for Confirmation {
     type Output = Result<Timestamp, Error>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        Pin::new(&mut self.0).poll(cx).map(|result| match result {
+        Pin::new(&mut self.receiver).poll(cx).map(|result| match result {
             Ok(Ok(timestamp)) => Ok(timestamp),
             Ok(Err(failure)) => Err(Error::TxFailed(failure)),
             Err(_) => Err(Error::Stopped),
@@ -352,14 +383,15 @@ impl Transmitter {
             return Err(Error::NotFd);
         }
         let permit = self.shared.permits.clone().acquire_owned().await.map_err(|_| Error::Stopped)?;
-        let (done, confirmation) = oneshot::channel();
+        let (done, receiver) = oneshot::channel();
+        let seq = self.shared.sent.fetch_add(1, Ordering::Relaxed);
         let echo_id = {
             let mut slots = self.shared.slots.lock().unwrap_or_else(PoisonError::into_inner);
             if self.shared.permits.is_closed() {
                 return Err(Error::Stopped);
             }
             let index = slots.iter().position(Option::is_none).ok_or(Error::Stopped)?;
-            slots[index] = Some(Slot { _permit: permit, done });
+            slots[index] = Some(Slot::new(permit, seq, done));
             index
         };
         let mut buf = [0; FD_TS_LEN];
@@ -371,7 +403,50 @@ impl Transmitter {
             self.shared.slots.lock().unwrap_or_else(PoisonError::into_inner)[echo_id] = None;
             return Err(Error::Transfer(e));
         }
-        Ok(Confirmation(confirmation))
+        #[expect(clippy::cast_possible_truncation, reason = "fewer than ECHO_SLOTS (10)")]
+        Ok(Confirmation { receiver, echo_id: echo_id as u32, seq })
+    }
+
+    /// Asks the device to withdraw the frame `confirmation` is for, if its
+    /// transmission hasn't started ([`Request::Abort`], part of
+    /// [`feature::TX_CONFIRMATION`]). The confirmation then says which
+    /// happened: [`Error::TxFailed`] with [`TxFailure::Aborted`], or the
+    /// frame was sent; a device that can't withdraw frames lets it run its
+    /// course. A frame already confirmed is left alone. The frame's slot
+    /// stays taken until the device has the request, so that its `echo_id`
+    /// can't go to another frame first.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Unsupported`] when the channel wasn't started with transmit
+    /// confirmation, [`Error::Transfer`] if the request fails.
+    pub async fn abort(&self, confirmation: &Confirmation) -> Result<(), Error> {
+        if !self.shared.tx_confirmation {
+            return Err(Error::Unsupported(feature::TX_CONFIRMATION));
+        }
+        let index = confirmation.echo_id as usize;
+        let ours = |slot: &Option<Slot>| slot.as_ref().is_some_and(|slot| slot.seq == confirmation.seq);
+        {
+            let mut slots = self.shared.slots.lock().unwrap_or_else(PoisonError::into_inner);
+            match slots.get_mut(index) {
+                Some(Some(slot)) if slot.seq == confirmation.seq && slot.done.is_some() => slot.aborting = true,
+                _ => return Ok(()),
+            }
+        }
+        let mut buf = [0; 4];
+        let guard = &self.guard;
+        let request = crate::control_out_request(Request::Abort, self.channel.into(), guard.index, encode_u32(confirmation.echo_id, &mut buf));
+        let result = guard.interface.control_out(request, crate::CONTROL_TIMEOUT).await;
+        let mut slots = self.shared.slots.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(entry) = slots.get_mut(index).filter(|entry| ours(entry)) {
+            match entry {
+                // Echoed meanwhile: the slot can go now.
+                Some(slot) if slot.done.is_none() => *entry = None,
+                Some(slot) => slot.aborting = false,
+                None => {}
+            }
+        }
+        Ok(result?)
     }
 }
 
@@ -427,7 +502,7 @@ pub(crate) fn halves(interface: &Interface, index: u16, channel: u8, endpoints: 
             fd: settings.data.is_some(),
             listen_only: settings.listen_only,
             shared: shared.clone(),
-            _guard: guard.clone(),
+            guard: guard.clone(),
         },
         Receiver { events: receiver, shared, _guard: guard },
     ))
@@ -536,15 +611,23 @@ fn handle(host: &HostFrame, timestamp: Timestamp, shared: &Shared) -> Option<Eve
         shared.overflows.fetch_add(1, Ordering::Relaxed);
     }
     if host.echo_id != ECHO_ID_RX {
-        let slot = usize::try_from(host.echo_id).ok().and_then(|index| shared.slots.lock().unwrap_or_else(PoisonError::into_inner).get_mut(index)?.take());
-        if let Some(slot) = slot {
-            let outcome = if shared.tx_confirmation && host.flags & frame_flag::TX_FAILED != 0 {
-                Err(TxFailure::from_code(host.data[0]))
-            } else {
-                Ok(timestamp)
-            };
+        let outcome = if shared.tx_confirmation && host.flags & frame_flag::TX_FAILED != 0 {
+            Err(TxFailure::from_code(host.data[0]))
+        } else {
+            Ok(timestamp)
+        };
+        let mut slots = shared.slots.lock().unwrap_or_else(PoisonError::into_inner);
+        let entry = usize::try_from(host.echo_id).ok().and_then(|index| slots.get_mut(index));
+        if let Some(entry) = entry
+            && let Some(slot) = entry.as_mut()
+            && let Some(done) = slot.done.take()
+        {
             // The sender may have dropped its confirmation.
-            let _ = slot.done.send(outcome);
+            let _ = done.send(outcome);
+            // Held while an abort of it is being asked for.
+            if !slot.aborting {
+                *entry = None;
+            }
         } else {
             debug!("gs_usb: echo {} with nothing sent", host.echo_id);
         }
@@ -741,10 +824,7 @@ mod tests {
         let shared = shared();
         let permits = Arc::new(Semaphore::new(1));
         let (done, mut confirmation) = oneshot::channel();
-        shared.slots.lock().unwrap()[3] = Some(Slot {
-            _permit: permits.clone().try_acquire_owned().unwrap(),
-            done,
-        });
+        shared.slots.lock().unwrap()[3] = Some(Slot::new(permits.clone().try_acquire_owned().unwrap(), 0, done));
         assert_eq!(permits.available_permits(), 0);
         let frame = Frame::Can(CanFrame::new(CanId::new_standard(1).unwrap(), &[]).unwrap());
         let echo = to_host(&frame, 3, 0);
@@ -760,10 +840,7 @@ mod tests {
         for (confirming, expected) in [(true, Err(TxFailure::BusOff)), (false, Ok(()))] {
             let shared = Shared::new(confirming);
             let (done, mut confirmation) = oneshot::channel();
-            shared.slots.lock().unwrap()[1] = Some(Slot {
-                _permit: shared.permits.clone().try_acquire_owned().unwrap(),
-                done,
-            });
+            shared.slots.lock().unwrap()[1] = Some(Slot::new(shared.permits.clone().try_acquire_owned().unwrap(), 0, done));
             let frame = Frame::Can(CanFrame::new(CanId::new_standard(1).unwrap(), &[0x55]).unwrap());
             let mut echo = to_host(&frame, 1, 0);
             echo.flags |= frame_flag::TX_FAILED;
@@ -778,10 +855,7 @@ mod tests {
     fn a_zero_length_fd_echo_keeps_its_reason() {
         let shared = Shared::new(true);
         let (done, mut confirmation) = oneshot::channel();
-        shared.slots.lock().unwrap()[0] = Some(Slot {
-            _permit: shared.permits.clone().try_acquire_owned().unwrap(),
-            done,
-        });
+        shared.slots.lock().unwrap()[0] = Some(Slot::new(shared.permits.clone().try_acquire_owned().unwrap(), 0, done));
         let frame = Frame::Fd(CanFdFrame::new(CanId::new_standard(1).unwrap(), &[], true, false).unwrap());
         let mut echo = to_host(&frame, 0, 0);
         echo.flags |= frame_flag::TX_FAILED;
@@ -793,13 +867,29 @@ mod tests {
     }
 
     #[test]
+    fn a_slot_being_aborted_stays_taken_after_its_echo() {
+        let shared = Shared::new(true);
+        let (done, mut confirmation) = oneshot::channel();
+        let mut slot = Slot::new(shared.permits.clone().try_acquire_owned().unwrap(), 7, done);
+        slot.aborting = true;
+        shared.slots.lock().unwrap()[2] = Some(slot);
+        let frame = Frame::Can(CanFrame::new(CanId::new_standard(1).unwrap(), &[]).unwrap());
+        let mut echo = to_host(&frame, 2, 0);
+        echo.flags |= frame_flag::TX_FAILED;
+        echo.data[0] = tx_failed::ABORTED;
+        assert!(handle(&echo, stamp(), &shared).is_none());
+        assert_eq!(confirmation.try_recv().unwrap().map(drop), Err(TxFailure::Aborted));
+        // Settled, but held: its echo_id can't go to another frame yet.
+        let slots = shared.slots.lock().unwrap();
+        assert!(slots[2].as_ref().is_some_and(|slot| slot.done.is_none()));
+        assert_eq!(shared.permits.available_permits(), ECHO_SLOTS - 1);
+    }
+
+    #[test]
     fn stopping_fails_what_waits() {
         let shared = shared();
         let (done, mut confirmation) = oneshot::channel();
-        shared.slots.lock().unwrap()[0] = Some(Slot {
-            _permit: shared.permits.clone().try_acquire_owned().unwrap(),
-            done,
-        });
+        shared.slots.lock().unwrap()[0] = Some(Slot::new(shared.permits.clone().try_acquire_owned().unwrap(), 0, done));
         shared.stop();
         // The confirmation's sender is gone, and no slot can be taken.
         assert!(matches!(confirmation.try_recv(), Err(oneshot::error::TryRecvError::Closed)));

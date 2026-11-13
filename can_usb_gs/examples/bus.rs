@@ -10,7 +10,7 @@
 //! ```text
 //! cargo run --example bus -- [--serial <serial number>] [--bitrate 250000]
 //!     [--count 10] [--listen 5] [--fd <data bitrate>] [--one-shot]
-//!     [--listen-only] [--bus-errors]
+//!     [--listen-only] [--bus-errors] [--abort-after <ms>]
 //! ```
 //!
 //! `--help` describes each option.
@@ -58,6 +58,10 @@ struct Options {
     /// Report each bus error as an error frame.
     #[arg(long)]
     bus_errors: bool,
+    /// Abort a frame not confirmed within this many milliseconds (a device
+    /// with transmit confirmation).
+    #[arg(long, value_name = "MS")]
+    abort_after: Option<u64>,
 }
 
 /// An error frame in words, as Linux's `candump -e` would put it.
@@ -200,7 +204,28 @@ async fn main() -> Result<(), can_usb_gs::Error> {
                 continue;
             }
         };
-        match tokio::time::timeout(Duration::from_secs(1), confirmation).await {
+        // With --abort-after, the confirmation if it came in time, else it
+        // is aborted and waited for as without.
+        let mut confirmation = confirmation;
+        let early = match options.abort_after {
+            Some(ms) => {
+                if let Ok(result) = tokio::time::timeout(Duration::from_millis(ms), &mut confirmation).await {
+                    Some(result)
+                } else {
+                    match tx.abort(&confirmation).await {
+                        Ok(()) => println!("tx {n}: not confirmed within {ms} ms, abort asked"),
+                        Err(e) => println!("tx {n}: abort failed: {e}"),
+                    }
+                    None
+                }
+            }
+            None => None,
+        };
+        let outcome = match early {
+            Some(result) => Ok(result),
+            None => tokio::time::timeout(Duration::from_secs(1), confirmation).await,
+        };
+        match outcome {
             Ok(Ok(timestamp)) => {
                 let micros = timestamp.device_micros();
                 let gap = micros.zip(previous).map(|(now, then): (u64, u64)| now - then);

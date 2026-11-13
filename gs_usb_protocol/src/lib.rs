@@ -60,6 +60,17 @@ pub enum Request {
     GetTermination,
     /// IN, a [`DeviceState`]: the bus state and error counters.
     GetState,
+    /// OUT, a `u32`: the `echo_id` of a frame to withdraw if its
+    /// transmission hasn't started. An extension of ferrocan's, part of
+    /// [`feature::TX_CONFIRMATION`]: a device offering that accepts it, and
+    /// the frame's echo then says what happened (sent, or
+    /// [`frame_flag::TX_FAILED`] with [`tx_failed::ABORTED`]); one that
+    /// can't withdraw frames lets it run its course. An `echo_id` not
+    /// pending is ignored, so the host must not give the `echo_id` to
+    /// another frame until the request has completed, even if the frame's
+    /// echo comes first. Its number, 160, keeps clear of candleLight's and
+    /// others' requests (0 to 32 so far) and of the top of the range.
+    Abort = 160,
 }
 
 impl Request {
@@ -88,6 +99,7 @@ impl Request {
             12 => Self::SetTermination,
             13 => Self::GetTermination,
             14 => Self::GetState,
+            160 => Self::Abort,
             _ => return None,
         })
     }
@@ -162,7 +174,7 @@ pub mod tx_failed {
     pub const GAVE_UP: u8 = 1;
     /// Dropped on going bus-off.
     pub const BUS_OFF: u8 = 2;
-    /// Aborted.
+    /// Aborted ([`Request::Abort`]), before its transmission started.
     pub const ABORTED: u8 = 3;
     /// The controller's report of the transmission was lost: it may have
     /// been sent.
@@ -172,6 +184,8 @@ pub mod tx_failed {
     /// Given up after a single-shot attempt failed on an error (no
     /// acknowledgement, say).
     pub const TX_ERROR: u8 = 6;
+    /// Aborted, but it may have been sent first: the device can't tell.
+    pub const ABORTED_UNCONFIRMED: u8 = 7;
 }
 
 /// Flags in [`HostFrame::can_id`], as in Linux's `struct can_frame`.
@@ -694,6 +708,8 @@ mod tests {
         assert_eq!(Request::from_u8(4), Some(Request::BtConst));
         assert_eq!(Request::from_u8(14), Some(Request::GetState));
         assert_eq!(Request::from_u8(15), None);
+        assert_eq!(Request::from_u8(160), Some(Request::Abort));
+        assert_eq!(Request::Abort.code(), 160);
     }
 
     #[test]
