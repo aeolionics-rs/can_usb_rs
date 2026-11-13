@@ -197,11 +197,17 @@ async fn main() -> Result<(), can_usb_gs::Error> {
         } else {
             Frame::Can(CanFrame::new(id, &n.to_be_bytes()).expect("4 bytes"))
         };
-        let confirmation = match tx.send(&frame).await {
-            Ok(confirmation) => confirmation,
-            Err(e) => {
+        // The device stops taking frames while its queue is full, as on a
+        // bus where nothing acknowledges them.
+        let confirmation = match tokio::time::timeout(Duration::from_secs(1), tx.send(&frame)).await {
+            Ok(Ok(confirmation)) => confirmation,
+            Ok(Err(e)) => {
                 println!("tx {n}: {e}");
                 continue;
+            }
+            Err(_) => {
+                println!("tx {n}: not taken by the device within 1 s; no more sent");
+                break;
             }
         };
         // With --abort-after, the confirmation if it came in time, else it
@@ -237,5 +243,24 @@ async fn main() -> Result<(), can_usb_gs::Error> {
         }
     }
     let _rx = receiving.await.expect("receiver task");
+    // The counters now, not as of the last error frame.
+    match device.state(0).await {
+        Ok(state) => println!("device: {}, counters tx {} rx {}", state_name(state.state), state.txerr, state.rxerr),
+        Err(e) => println!("device state: {e}"),
+    }
     Ok(())
+}
+
+/// A `GET_STATE` state in words.
+fn state_name(code: u32) -> String {
+    use can_usb_gs::protocol::state;
+    match code {
+        state::ERROR_ACTIVE => "error active".into(),
+        state::ERROR_WARNING => "error warning".into(),
+        state::ERROR_PASSIVE => "error passive".into(),
+        state::BUS_OFF => "bus-off".into(),
+        state::STOPPED => "stopped".into(),
+        state::SLEEPING => "sleeping".into(),
+        other => format!("state {other}"),
+    }
 }

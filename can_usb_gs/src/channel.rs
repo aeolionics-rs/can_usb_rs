@@ -8,6 +8,7 @@
 use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll};
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
@@ -246,6 +247,30 @@ impl Slot {
     }
 }
 
+/// A slot held while an abort of its frame is asked for; dropped, it lets
+/// the slot go if the frame was echoed meanwhile, or else stops holding it.
+struct Aborting<'a> {
+    shared: &'a Shared,
+    index: usize,
+    seq: u64,
+}
+
+impl Drop for Aborting<'_> {
+    fn drop(&mut self) {
+        let mut slots = self.shared.slots.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(entry) = slots.get_mut(self.index)
+            && let Some(slot) = entry.as_mut()
+            && slot.seq == self.seq
+        {
+            if slot.done.is_none() {
+                *entry = None;
+            } else {
+                slot.aborting = false;
+            }
+        }
+    }
+}
+
 /// What the reader, [`Transmitter`] and [`Receiver`] share.
 struct Shared {
     bus: Mutex<(BusState, ErrorCounters)>,
@@ -316,6 +341,10 @@ pub struct Transmitter {
     shared: Arc<Shared>,
     /// Keeps the channel started; and the interface, for aborts.
     guard: Arc<Guard>,
+    /// The slots of the OUT transfers not yet completed, in submission
+    /// order: a [`send`](Self::send) dropped while it waited leaves its own
+    /// to the next.
+    submitted: VecDeque<(usize, u64)>,
 }
 
 /// A frame's echo, which resolves with the echo's [`Timestamp`].
@@ -369,6 +398,12 @@ impl Transmitter {
     /// and then for the device to take it. Await the [`Confirmation`] for
     /// its echo, or drop it.
     ///
+    /// It can be dropped, under a timeout say, while it waits (the device
+    /// stops taking frames while its own queue is full, as on a bus where
+    /// nothing acknowledges them). Dropped before the device took the
+    /// frame, the frame may still be sent, with no confirmation to report
+    /// it; the next send collects what is left of it.
+    ///
     /// # Errors
     ///
     /// [`Error::NotFd`] for an FD frame on a classic channel,
@@ -398,10 +433,26 @@ impl Transmitter {
         #[expect(clippy::cast_possible_truncation, reason = "fewer than ECHO_SLOTS (10)")]
         let bytes = to_host(frame, echo_id as u32, self.channel).encode(&mut buf);
         self.out.submit(Buffer::from(bytes));
-        let completion = self.out.next_complete().await;
-        if let Err(e) = completion.status {
-            self.shared.slots.lock().unwrap_or_else(PoisonError::into_inner)[echo_id] = None;
-            return Err(Error::Transfer(e));
+        self.submitted.push_back((echo_id, seq));
+        // Transfers complete in order: first any a dropped send left.
+        loop {
+            let completion = self.out.next_complete().await;
+            let Some((index, sent)) = self.submitted.pop_front() else { continue };
+            let ours = (index, sent) == (echo_id, seq);
+            if let Err(e) = completion.status {
+                // Never reached the device: its slot can go.
+                let mut slots = self.shared.slots.lock().unwrap_or_else(PoisonError::into_inner);
+                if slots[index].as_ref().is_some_and(|slot| slot.seq == sent) {
+                    slots[index] = None;
+                }
+                if ours {
+                    return Err(Error::Transfer(e));
+                }
+                warn!("gs_usb: an earlier frame (slot {index}) didn't reach the device: {e}");
+            }
+            if ours {
+                break;
+            }
         }
         #[expect(clippy::cast_possible_truncation, reason = "fewer than ECHO_SLOTS (10)")]
         Ok(Confirmation { receiver, echo_id: echo_id as u32, seq })
@@ -414,7 +465,8 @@ impl Transmitter {
     /// frame was sent; a device that can't withdraw frames lets it run its
     /// course. A frame already confirmed is left alone. The frame's slot
     /// stays taken until the device has the request, so that its `echo_id`
-    /// can't go to another frame first.
+    /// can't go to another frame first. It can be dropped while it waits:
+    /// the slot is let go all the same.
     ///
     /// # Errors
     ///
@@ -425,7 +477,6 @@ impl Transmitter {
             return Err(Error::Unsupported(feature::TX_CONFIRMATION));
         }
         let index = confirmation.echo_id as usize;
-        let ours = |slot: &Option<Slot>| slot.as_ref().is_some_and(|slot| slot.seq == confirmation.seq);
         {
             let mut slots = self.shared.slots.lock().unwrap_or_else(PoisonError::into_inner);
             match slots.get_mut(index) {
@@ -433,20 +484,16 @@ impl Transmitter {
                 _ => return Ok(()),
             }
         }
+        // Lets the slot go however this ends, dropped while waiting included.
+        let _release = Aborting {
+            shared: &self.shared,
+            index,
+            seq: confirmation.seq,
+        };
         let mut buf = [0; 4];
         let guard = &self.guard;
         let request = crate::control_out_request(Request::Abort, self.channel.into(), guard.index, encode_u32(confirmation.echo_id, &mut buf));
-        let result = guard.interface.control_out(request, crate::CONTROL_TIMEOUT).await;
-        let mut slots = self.shared.slots.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(entry) = slots.get_mut(index).filter(|entry| ours(entry)) {
-            match entry {
-                // Echoed meanwhile: the slot can go now.
-                Some(slot) if slot.done.is_none() => *entry = None,
-                Some(slot) => slot.aborting = false,
-                None => {}
-            }
-        }
-        Ok(result?)
+        Ok(guard.interface.control_out(request, crate::CONTROL_TIMEOUT).await?)
     }
 }
 
@@ -503,6 +550,7 @@ pub(crate) fn halves(interface: &Interface, index: u16, channel: u8, endpoints: 
             listen_only: settings.listen_only,
             shared: shared.clone(),
             guard: guard.clone(),
+            submitted: VecDeque::new(),
         },
         Receiver { events: receiver, shared, _guard: guard },
     ))
@@ -771,6 +819,8 @@ impl BusStatus for Transmitter {
         Ok(self.shared.bus().0)
     }
 
+    /// As of the last error frame that carried them;
+    /// [`GsUsb::state`](crate::GsUsb::state) asks the device for them now.
     fn error_counters(&self) -> Result<ErrorCounters, Error> {
         Ok(self.shared.bus().1)
     }
@@ -783,6 +833,8 @@ impl BusStatus for Receiver {
         Ok(self.shared.bus().0)
     }
 
+    /// As of the last error frame that carried them;
+    /// [`GsUsb::state`](crate::GsUsb::state) asks the device for them now.
     fn error_counters(&self) -> Result<ErrorCounters, Error> {
         Ok(self.shared.bus().1)
     }
@@ -883,6 +935,30 @@ mod tests {
         let slots = shared.slots.lock().unwrap();
         assert!(slots[2].as_ref().is_some_and(|slot| slot.done.is_none()));
         assert_eq!(shared.permits.available_permits(), ECHO_SLOTS - 1);
+    }
+
+    #[test]
+    fn an_abort_lets_its_slot_go_however_it_ends() {
+        let shared = Shared::new(true);
+        for echoed in [true, false] {
+            let (done, _confirmation) = oneshot::channel();
+            let mut slot = Slot::new(shared.permits.clone().try_acquire_owned().unwrap(), 5, done);
+            slot.aborting = true;
+            if echoed {
+                slot.done = None;
+            }
+            shared.slots.lock().unwrap()[4] = Some(slot);
+            drop(Aborting { shared: &shared, index: 4, seq: 5 });
+            let slots = shared.slots.lock().unwrap();
+            if echoed {
+                assert!(slots[4].is_none(), "echoed meanwhile: free");
+            } else {
+                assert!(slots[4].as_ref().is_some_and(|slot| !slot.aborting), "not yet echoed: no longer held");
+            }
+            drop(slots);
+            shared.slots.lock().unwrap()[4] = None;
+        }
+        assert_eq!(shared.permits.available_permits(), ECHO_SLOTS);
     }
 
     #[test]
