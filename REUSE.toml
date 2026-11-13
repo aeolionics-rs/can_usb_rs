@@ -1,0 +1,21 @@
+version = 1
+
+# Files that can't carry a header, or that Cargo writes. gs_usb_protocol is
+# MIT OR Apache-2.0; the rest of the repository is Apache-2.0.
+[[annotations]]
+path = [
+    "Cargo.toml",
+    "Cargo.lock",
+    ".gitignore",
+    "rustfmt.toml",
+    "**/*.md",
+    "can_usb_gs/Cargo.toml",
+    "can_usb_kvaser/Cargo.toml",
+]
+SPDX-FileCopyrightText = "2026-2026. Aeolionics, LLC"
+SPDX-License-Identifier = "Apache-2.0"
+
+[[annotations]]
+path = "gs_usb_protocol/Cargo.toml"
+SPDX-FileCopyrightText = "2026-2026. Aeolionics, LLC"
+SPDX-License-Identifier = "MIT OR Apache-2.0"
