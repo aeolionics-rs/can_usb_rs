@@ -31,9 +31,11 @@
 //! ```
 
 mod channel;
+mod confirmed;
 mod timing;
 
 pub use channel::{Confirmation, ECHO_SLOTS, ErrorFrame, Event, Receiver, Settings, Timestamp, Transmitter, TxFailure};
+pub use confirmed::ConfirmedChannel;
 
 use core::time::Duration;
 use std::fmt::{Display, Formatter};
@@ -356,6 +358,35 @@ impl GsUsb {
     /// a bit rate its clock can't make, [`Error::Usb`] if the channel is
     /// already started, or a request failing.
     pub async fn start(&self, channel: u8, settings: &Settings) -> Result<(Transmitter, Receiver), Error> {
+        let flags = self.prepare(channel, settings).await?;
+        let halves = channel::halves(&self.interface, self.number.into(), channel, (self.bulk_in, self.bulk_out), settings, flags)?;
+        self.mode(channel, mode::START, flags).await?;
+        Ok(halves)
+    }
+
+    /// Starts `channel` with `settings` for can-hal's confirmed
+    /// transmission ([`ConfirmedChannel`]); dropping it stops it. The device
+    /// needs transmit confirmation ([`feature::TX_CONFIRMATION`]), so that a
+    /// frame's report means it was acknowledged on the bus, as can-hal's
+    /// confirmed channels promise, and not merely queued.
+    ///
+    /// # Errors
+    ///
+    /// As [`start`](Self::start), and [`Error::Unsupported`] for a device
+    /// without transmit confirmation.
+    pub async fn start_confirmed(&self, channel: u8, settings: &Settings) -> Result<ConfirmedChannel, Error> {
+        let flags = self.prepare(channel, settings).await?;
+        if flags & feature::TX_CONFIRMATION == 0 {
+            return Err(Error::Unsupported(feature::TX_CONFIRMATION));
+        }
+        let confirmed = confirmed::open(&self.interface, self.number.into(), channel, (self.bulk_in, self.bulk_out), settings, flags)?;
+        self.mode(channel, mode::START, flags).await?;
+        Ok(confirmed)
+    }
+
+    /// Resets `channel` and sets its bit timing for `settings`, returning
+    /// the mode flags to start it with.
+    async fn prepare(&self, channel: u8, settings: &Settings) -> Result<u32, Error> {
         let bt = self.bt_const(channel).await?;
         let has = |wanted: u32| bt.feature & wanted == wanted;
         let mut flags = bt.feature & (feature::HW_TIMESTAMP | feature::TX_CONFIRMATION);
@@ -390,9 +421,7 @@ impl GsUsb {
         if let Some(data) = data {
             self.control_out(Request::DataBittiming, channel.into(), DeviceBittiming::encode(&data, &mut buf)).await?;
         }
-        let halves = channel::halves(&self.interface, self.number.into(), channel, (self.bulk_in, self.bulk_out), settings, flags)?;
-        self.mode(channel, mode::START, flags).await?;
-        Ok(halves)
+        Ok(flags)
     }
 
     async fn mode(&self, channel: u8, mode: u32, flags: u32) -> Result<(), Error> {

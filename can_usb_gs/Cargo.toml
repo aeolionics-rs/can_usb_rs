@@ -8,7 +8,7 @@ keywords = ["can", "usb", "gs_usb", "candlelight"]
 repository = "https://github.com/aeolionics-rs/can_usb_rs.git"
 
 [dependencies]
-can-hal-rs = { version = "0.4.3", features = ["async"] }
+can-hal-rs = { version = "0.4.3", path = "../../can-hal-rs/can-hal", features = ["async"] }
 gs_usb_protocol = { version = "0.1.0", path = "../gs_usb_protocol" }
 nusb = { version = "0.2.7", features = ["tokio"] }
 tokio = { version = "1.53.1", features = ["rt", "sync", "time"] }

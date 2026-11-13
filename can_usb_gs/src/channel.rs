@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use can_hal::async_channel::{AsyncReceive, AsyncReceiveFd, AsyncTransmit, AsyncTransmitFd};
-use can_hal::{BusState, BusStatus, CanFdFrame, CanFrame, CanId, ErrorCounters, Frame, SamplePoint, Timestamped};
+use can_hal::{BusState, BusStatus, CanFdFrame, CanFrame, CanId, ErrorCounters, Frame, SamplePoint, Timestamped, TransmitId};
 use gs_usb_protocol::{ECHO_ID_RX, FD_TS_LEN, HostFrame, Request, can_err, can_id, encode_u32, fd_len, feature, frame_flag, tx_failed};
 use nusb::transfer::{Buffer, Bulk, In, Out, TransferError};
 use nusb::{Endpoint, Interface, MaybeFuture};
@@ -123,6 +123,12 @@ pub struct Timestamp {
 }
 
 impl Timestamp {
+    /// A timestamp for tests: no device time, received now.
+    #[cfg(test)]
+    pub(crate) fn for_test() -> Self {
+        Self { device_micros: None, received: Instant::now() }
+    }
+
     /// The device's microsecond timer at the frame, extended past its 32-bit
     /// wrap, if the device stamps frames. Its zero is the device's, and its
     /// rate the device's clock, which may drift from the host's.
@@ -227,17 +233,26 @@ impl std::fmt::Display for TxFailure {
 /// abort of it is being asked for, the slot stays held after the echo, so
 /// that no other frame takes its `echo_id` before the device has the
 /// request.
-struct Slot {
+pub(crate) struct Slot {
     _permit: OwnedSemaphorePermit,
     /// Which frame: one sent after it may take the slot once it is free.
-    seq: u64,
+    pub(crate) seq: u64,
     /// Taken by its echo.
-    done: Option<oneshot::Sender<Result<Timestamp, TxFailure>>>,
-    aborting: bool,
+    pub(crate) done: Option<Done>,
+    pub(crate) aborting: bool,
+}
+
+/// Who learns how a frame's transmission ended.
+pub(crate) enum Done {
+    /// A [`Confirmation`].
+    Future(oneshot::Sender<Result<Timestamp, TxFailure>>),
+    /// A [`ConfirmedChannel`](crate::ConfirmedChannel)'s events, by the id
+    /// it gave the frame.
+    Confirmed(TransmitId),
 }
 
 impl Slot {
-    fn new(permit: OwnedSemaphorePermit, seq: u64, done: oneshot::Sender<Result<Timestamp, TxFailure>>) -> Self {
+    pub(crate) fn new(permit: OwnedSemaphorePermit, seq: u64, done: Done) -> Self {
         Self {
             _permit: permit,
             seq,
@@ -272,22 +287,22 @@ impl Drop for Aborting<'_> {
 }
 
 /// What the reader, [`Transmitter`] and [`Receiver`] share.
-struct Shared {
+pub(crate) struct Shared {
     bus: Mutex<(BusState, ErrorCounters)>,
     /// One permit per free slot; closed once the reader has stopped.
-    permits: Arc<Semaphore>,
-    slots: Mutex<Vec<Option<Slot>>>,
-    dropped: AtomicU64,
+    pub(crate) permits: Arc<Semaphore>,
+    pub(crate) slots: Mutex<Vec<Option<Slot>>>,
+    pub(crate) dropped: AtomicU64,
     overflows: AtomicU64,
     /// The frames sent so far, to tell one slot's frames apart.
-    sent: AtomicU64,
+    pub(crate) sent: AtomicU64,
     /// Whether the channel was started with transmit confirmation, so that
     /// echoes say when a frame wasn't sent.
-    tx_confirmation: bool,
+    pub(crate) tx_confirmation: bool,
 }
 
 impl Shared {
-    fn new(tx_confirmation: bool) -> Self {
+    pub(crate) fn new(tx_confirmation: bool) -> Self {
         Self {
             bus: Mutex::new((BusState::ErrorActive, ErrorCounters { transmit: 0, receive: 0 })),
             permits: Arc::new(Semaphore::new(ECHO_SLOTS)),
@@ -299,7 +314,7 @@ impl Shared {
         }
     }
 
-    fn bus(&self) -> (BusState, ErrorCounters) {
+    pub(crate) fn bus(&self) -> (BusState, ErrorCounters) {
         *self.bus.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
@@ -313,11 +328,11 @@ impl Shared {
 }
 
 /// Stops the channel when both halves are gone.
-struct Guard {
-    interface: Interface,
-    index: u16,
-    channel: u8,
-    reader: JoinHandle<()>,
+pub(crate) struct Guard {
+    pub(crate) interface: Interface,
+    pub(crate) index: u16,
+    pub(crate) channel: u8,
+    pub(crate) reader: JoinHandle<()>,
 }
 
 impl Drop for Guard {
@@ -426,7 +441,7 @@ impl Transmitter {
                 return Err(Error::Stopped);
             }
             let index = slots.iter().position(Option::is_none).ok_or(Error::Stopped)?;
-            slots[index] = Some(Slot::new(permit, seq, done));
+            slots[index] = Some(Slot::new(permit, seq, Done::Future(done)));
             index
         };
         let mut buf = [0; FD_TS_LEN];
@@ -535,7 +550,7 @@ pub(crate) fn halves(interface: &Interface, index: u16, channel: u8, endpoints: 
     let out = interface.endpoint::<Bulk, Out>(endpoints.1)?;
     let shared = Arc::new(Shared::new(flags & feature::TX_CONFIRMATION != 0));
     let (events, receiver) = mpsc::channel(RECEIVE_QUEUE_LEN);
-    let reader = tokio::spawn(read(bulk_in, events, shared.clone(), channel, timestamped));
+    let reader = tokio::spawn(read(bulk_in, Sink::Async(events), shared.clone(), channel, timestamped));
     let guard = Arc::new(Guard {
         interface: interface.clone(),
         index,
@@ -608,12 +623,51 @@ impl Clock {
 /// Reads bulk IN until the device goes or the channel stops, then fails
 /// what waits for an echo. Dropping `events` on return ends the
 /// [`Receiver`] too.
-async fn read(bulk_in: Endpoint<Bulk, In>, events: mpsc::Sender<Event>, shared: Arc<Shared>, channel: u8, timestamped: bool) {
-    read_frames(bulk_in, &events, &shared, channel, timestamped).await;
+pub(crate) async fn read(bulk_in: Endpoint<Bulk, In>, sink: Sink, shared: Arc<Shared>, channel: u8, timestamped: bool) {
+    read_frames(bulk_in, &sink, &shared, channel, timestamped).await;
     shared.stop();
 }
 
-async fn read_frames(mut bulk_in: Endpoint<Bulk, In>, events: &mpsc::Sender<Event>, shared: &Shared, channel: u8, timestamped: bool) {
+/// Where the reader puts what it reads.
+pub(crate) enum Sink {
+    /// A [`Receiver`]'s events; echoes settle [`Confirmation`]s.
+    Async(mpsc::Sender<Event>),
+    /// A [`ConfirmedChannel`](crate::ConfirmedChannel)'s can-hal events,
+    /// echoes among them, in the order they come.
+    Confirmed(std::sync::mpsc::SyncSender<can_hal::Event<Frame, Timestamp>>),
+}
+
+impl Sink {
+    /// Passes on what [`handle`] made of a frame, and for a confirmed
+    /// channel a change of bus state from `before`.
+    fn deliver(&self, output: Option<Output>, before: BusState, shared: &Shared) {
+        let sent = match self {
+            Self::Async(events) => match output {
+                Some(Output::Event(event)) => events.try_send(event).is_ok(),
+                Some(Output::Transmitted { .. }) | None => true,
+            },
+            Self::Confirmed(events) => {
+                let event = match output {
+                    Some(Output::Event(Event::Received(received))) => Some(can_hal::Event::Received(received)),
+                    Some(Output::Transmitted { id, outcome }) => Some(can_hal::Event::Transmitted {
+                        id,
+                        outcome: crate::confirmed::outcome(outcome),
+                    }),
+                    // can-hal has no events for these.
+                    Some(Output::Event(_)) | None => None,
+                };
+                let now = shared.bus().0;
+                let changed = (now != before).then_some(can_hal::Event::BusStateChanged(now));
+                [event, changed].into_iter().flatten().all(|event| events.try_send(event).is_ok())
+            }
+        };
+        if !sent {
+            shared.dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+async fn read_frames(mut bulk_in: Endpoint<Bulk, In>, sink: &Sink, shared: &Shared, channel: u8, timestamped: bool) {
     let packet = bulk_in.max_packet_size();
     let len = FD_TS_LEN.div_ceil(packet) * packet;
     for _ in 0..IN_TRANSFERS {
@@ -637,11 +691,9 @@ async fn read_frames(mut bulk_in: Endpoint<Bulk, In>, events: &mpsc::Sender<Even
                     device_micros: host.timestamp_us.map(|us| clock.extend(us)),
                     received,
                 };
-                if let Some(event) = handle(&host, timestamp, shared)
-                    && events.try_send(event).is_err()
-                {
-                    shared.dropped.fetch_add(1, Ordering::Relaxed);
-                }
+                let before = shared.bus().0;
+                let output = handle(&host, timestamp, shared);
+                sink.deliver(output, before, shared);
             }
             Ok(host) => debug!("gs_usb: frame for channel {}", host.channel),
             Err(e) => warn!("gs_usb: undecodable IN transfer ({} bytes): {e:?}", completion.buffer.len()),
@@ -653,8 +705,18 @@ async fn read_frames(mut bulk_in: Endpoint<Bulk, In>, events: &mpsc::Sender<Even
     }
 }
 
+/// What a frame from the device comes to.
+#[derive(Debug)]
+pub(crate) enum Output {
+    /// An event for the receiver.
+    Event(Event),
+    /// How the transmission of a [`ConfirmedChannel`](crate::ConfirmedChannel)'s
+    /// frame ended.
+    Transmitted { id: TransmitId, outcome: Result<Timestamp, TxFailure> },
+}
+
 /// Settles an echo or updates the bus state; returns what the receiver gets.
-fn handle(host: &HostFrame, timestamp: Timestamp, shared: &Shared) -> Option<Event> {
+fn handle(host: &HostFrame, timestamp: Timestamp, shared: &Shared) -> Option<Output> {
     if host.flags & frame_flag::OVERFLOW != 0 {
         shared.overflows.fetch_add(1, Ordering::Relaxed);
     }
@@ -670,15 +732,20 @@ fn handle(host: &HostFrame, timestamp: Timestamp, shared: &Shared) -> Option<Eve
             && let Some(slot) = entry.as_mut()
             && let Some(done) = slot.done.take()
         {
-            // The sender may have dropped its confirmation.
-            let _ = done.send(outcome);
             // Held while an abort of it is being asked for.
             if !slot.aborting {
                 *entry = None;
             }
-        } else {
-            debug!("gs_usb: echo {} with nothing sent", host.echo_id);
+            return match done {
+                Done::Future(sender) => {
+                    // The sender may have dropped its confirmation.
+                    let _ = sender.send(outcome);
+                    None
+                }
+                Done::Confirmed(id) => Some(Output::Transmitted { id, outcome }),
+            };
         }
+        debug!("gs_usb: echo {} with nothing sent", host.echo_id);
         return None;
     }
     if host.can_id & can_id::ERR != 0 {
@@ -686,7 +753,7 @@ fn handle(host: &HostFrame, timestamp: Timestamp, shared: &Shared) -> Option<Eve
         let mut data = [0; 8];
         data.copy_from_slice(&host.data[..8]);
         update_bus(class, data, shared);
-        return Some(Event::Error(ErrorFrame { class, data, timestamp }));
+        return Some(Output::Event(Event::Error(ErrorFrame { class, data, timestamp })));
     }
     let id = if host.can_id & can_id::EFF != 0 {
         CanId::new_extended(host.can_id & can_id::EFF_MASK)
@@ -695,14 +762,14 @@ fn handle(host: &HostFrame, timestamp: Timestamp, shared: &Shared) -> Option<Eve
     }
     .expect("masked to range");
     if host.can_id & can_id::RTR != 0 {
-        return Some(Event::Remote { id, dlc: host.can_dlc, timestamp });
+        return Some(Output::Event(Event::Remote { id, dlc: host.can_dlc, timestamp }));
     }
     let frame = if host.is_fd() {
         Frame::Fd(CanFdFrame::new(id, &host.data[..fd_len(host.can_dlc)], host.flags & frame_flag::BRS != 0, host.flags & frame_flag::ESI != 0).expect("an FD length"))
     } else {
         Frame::Can(CanFrame::new(id, &host.data[..usize::from(host.can_dlc.min(8))]).expect("at most 8 bytes"))
     };
-    Some(Event::Received(Timestamped::new(frame, timestamp)))
+    Some(Output::Event(Event::Received(Timestamped::new(frame, timestamp))))
 }
 
 /// The bus state and counters an error frame reports.
@@ -727,7 +794,7 @@ fn update_bus(class: u32, data: [u8; 8], shared: &Shared) {
 }
 
 /// A can-hal frame as `gs_usb` sends it.
-fn to_host(frame: &Frame, echo_id: u32, channel: u8) -> HostFrame {
+pub(crate) fn to_host(frame: &Frame, echo_id: u32, channel: u8) -> HostFrame {
     let id = match frame.id() {
         CanId::Standard(id) => u32::from(id),
         CanId::Extended(id) => id | can_id::EFF,
@@ -864,7 +931,7 @@ mod tests {
         for frame in frames {
             let host = HostFrame { echo_id: ECHO_ID_RX, ..to_host(&frame, 0, 0) };
             match handle(&host, stamp(), &shared) {
-                Some(Event::Received(received)) => assert_eq!(received.into_frame(), frame),
+                Some(Output::Event(Event::Received(received))) => assert_eq!(received.into_frame(), frame),
                 other => panic!("{other:?}"),
             }
         }
@@ -876,7 +943,7 @@ mod tests {
         let shared = shared();
         let permits = Arc::new(Semaphore::new(1));
         let (done, mut confirmation) = oneshot::channel();
-        shared.slots.lock().unwrap()[3] = Some(Slot::new(permits.clone().try_acquire_owned().unwrap(), 0, done));
+        shared.slots.lock().unwrap()[3] = Some(Slot::new(permits.clone().try_acquire_owned().unwrap(), 0, Done::Future(done)));
         assert_eq!(permits.available_permits(), 0);
         let frame = Frame::Can(CanFrame::new(CanId::new_standard(1).unwrap(), &[]).unwrap());
         let echo = to_host(&frame, 3, 0);
@@ -892,7 +959,7 @@ mod tests {
         for (confirming, expected) in [(true, Err(TxFailure::BusOff)), (false, Ok(()))] {
             let shared = Shared::new(confirming);
             let (done, mut confirmation) = oneshot::channel();
-            shared.slots.lock().unwrap()[1] = Some(Slot::new(shared.permits.clone().try_acquire_owned().unwrap(), 0, done));
+            shared.slots.lock().unwrap()[1] = Some(Slot::new(shared.permits.clone().try_acquire_owned().unwrap(), 0, Done::Future(done)));
             let frame = Frame::Can(CanFrame::new(CanId::new_standard(1).unwrap(), &[0x55]).unwrap());
             let mut echo = to_host(&frame, 1, 0);
             echo.flags |= frame_flag::TX_FAILED;
@@ -907,7 +974,7 @@ mod tests {
     fn a_zero_length_fd_echo_keeps_its_reason() {
         let shared = Shared::new(true);
         let (done, mut confirmation) = oneshot::channel();
-        shared.slots.lock().unwrap()[0] = Some(Slot::new(shared.permits.clone().try_acquire_owned().unwrap(), 0, done));
+        shared.slots.lock().unwrap()[0] = Some(Slot::new(shared.permits.clone().try_acquire_owned().unwrap(), 0, Done::Future(done)));
         let frame = Frame::Fd(CanFdFrame::new(CanId::new_standard(1).unwrap(), &[], true, false).unwrap());
         let mut echo = to_host(&frame, 0, 0);
         echo.flags |= frame_flag::TX_FAILED;
@@ -922,7 +989,7 @@ mod tests {
     fn a_slot_being_aborted_stays_taken_after_its_echo() {
         let shared = Shared::new(true);
         let (done, mut confirmation) = oneshot::channel();
-        let mut slot = Slot::new(shared.permits.clone().try_acquire_owned().unwrap(), 7, done);
+        let mut slot = Slot::new(shared.permits.clone().try_acquire_owned().unwrap(), 7, Done::Future(done));
         slot.aborting = true;
         shared.slots.lock().unwrap()[2] = Some(slot);
         let frame = Frame::Can(CanFrame::new(CanId::new_standard(1).unwrap(), &[]).unwrap());
@@ -942,7 +1009,7 @@ mod tests {
         let shared = Shared::new(true);
         for echoed in [true, false] {
             let (done, _confirmation) = oneshot::channel();
-            let mut slot = Slot::new(shared.permits.clone().try_acquire_owned().unwrap(), 5, done);
+            let mut slot = Slot::new(shared.permits.clone().try_acquire_owned().unwrap(), 5, Done::Future(done));
             slot.aborting = true;
             if echoed {
                 slot.done = None;
@@ -965,7 +1032,7 @@ mod tests {
     fn stopping_fails_what_waits() {
         let shared = shared();
         let (done, mut confirmation) = oneshot::channel();
-        shared.slots.lock().unwrap()[0] = Some(Slot::new(shared.permits.clone().try_acquire_owned().unwrap(), 0, done));
+        shared.slots.lock().unwrap()[0] = Some(Slot::new(shared.permits.clone().try_acquire_owned().unwrap(), 0, Done::Future(done)));
         shared.stop();
         // The confirmation's sender is gone, and no slot can be taken.
         assert!(matches!(confirmation.try_recv(), Err(oneshot::error::TryRecvError::Closed)));
@@ -982,7 +1049,7 @@ mod tests {
             host
         };
         let passive = error(can_err::CRTL | can_err::CNT, [0, can_err::crtl::TX_PASSIVE, 0, 0, 0, 0, 136, 0]);
-        assert!(matches!(handle(&passive, stamp(), &shared), Some(Event::Error(ErrorFrame { class, .. })) if class == can_err::CRTL | can_err::CNT));
+        assert!(matches!(handle(&passive, stamp(), &shared), Some(Output::Event(Event::Error(ErrorFrame { class, .. }))) if class == can_err::CRTL | can_err::CNT));
         assert_eq!(shared.bus(), (BusState::ErrorPassive, ErrorCounters { transmit: 136, receive: 0 }));
         handle(&error(can_err::BUSOFF, [0; 8]), stamp(), &shared);
         assert_eq!(shared.bus().0, BusState::BusOff);
@@ -997,7 +1064,7 @@ mod tests {
         host.can_id |= can_id::RTR;
         host.can_dlc = 4;
         host.flags = frame_flag::OVERFLOW;
-        assert!(matches!(handle(&host, stamp(), &shared), Some(Event::Remote { dlc: 4, .. })));
+        assert!(matches!(handle(&host, stamp(), &shared), Some(Output::Event(Event::Remote { dlc: 4, .. }))));
         assert_eq!(shared.overflows.load(Ordering::Relaxed), 1);
     }
 
