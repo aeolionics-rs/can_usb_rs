@@ -179,7 +179,7 @@ async fn main() -> Result<(), can_usb_gs::Error> {
         settings = settings.bus_errors();
     }
     let (mut tx, rx) = device.start(0, &settings).await?;
-    println!("started at {} bit/s, data {:?}", options.bitrate, options.data_bitrate);
+    println!("started at {} bit/s, data {:?}, TX confirmation {}", options.bitrate, options.data_bitrate, tx.confirms_transmission());
 
     let receiving = tokio::spawn(receive(rx, options.listen));
 

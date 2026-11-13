@@ -127,6 +127,15 @@ pub mod feature {
     pub const BERR_REPORTING: u32 = 1 << 12;
     /// The state request.
     pub const GET_STATE: u32 = 1 << 13;
+    /// Transmit confirmation, an extension of ferrocan's (Linux and
+    /// candleLight have no such bit): as a feature, each echo comes when the
+    /// frame's transmission has ended, so an echo means acknowledged on the
+    /// bus unless it says otherwise (candleLight echoes a frame as it queues
+    /// it); as a mode, an echo of a frame not sent says so, with
+    /// [`frame_flag::TX_FAILED`] and the reason in its first data byte
+    /// ([`tx_failed`]). Bit 28 keeps clear of both ends of the range, where
+    /// others' extensions may grow.
+    pub const TX_CONFIRMATION: u32 = 1 << 28;
 }
 
 /// Flags in [`HostFrame::flags`].
@@ -139,6 +148,24 @@ pub mod frame_flag {
     pub const BRS: u8 = 1 << 2;
     /// Error state indicator (CAN FD).
     pub const ESI: u8 = 1 << 3;
+    /// On an echo, with [`feature::TX_CONFIRMATION`] on: the frame was not
+    /// sent, for the reason in `data[0]` ([`tx_failed`]). An extension of
+    /// ferrocan's.
+    pub const TX_FAILED: u8 = 1 << 7;
+}
+
+/// Why a frame was not sent, in `data[0]` of an echo flagged
+/// [`frame_flag::TX_FAILED`].
+pub mod tx_failed {
+    /// Given up after a single-shot attempt failed.
+    pub const GAVE_UP: u8 = 1;
+    /// Dropped on going bus-off.
+    pub const BUS_OFF: u8 = 2;
+    /// Aborted.
+    pub const ABORTED: u8 = 3;
+    /// The controller's report of the transmission was lost: it may have
+    /// been sent.
+    pub const UNCONFIRMED: u8 = 4;
 }
 
 /// Flags in [`HostFrame::can_id`], as in Linux's `struct can_frame`.

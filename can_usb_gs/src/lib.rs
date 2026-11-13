@@ -11,7 +11,8 @@
 //! [`GsUsb::start`] starts a channel and returns its two halves, which
 //! implement can-hal's async traits: a [`Transmitter`] (each frame's echo
 //! and its timestamp come back as a [`Confirmation`]: the time on the bus or
-//! the time queued, as the firmware decides) and a
+//! the time queued, as the firmware decides, and with ferrocan's transmit
+//! confirmation a frame not sent fails with the reason) and a
 //! [`Receiver`] (frames, remote frames and error frames as [`Event`]s, and
 //! the bus state they report). It needs a tokio runtime.
 //!
@@ -32,7 +33,7 @@
 mod channel;
 mod timing;
 
-pub use channel::{Confirmation, ECHO_SLOTS, ErrorFrame, Event, Receiver, Settings, Timestamp, Transmitter};
+pub use channel::{Confirmation, ECHO_SLOTS, ErrorFrame, Event, Receiver, Settings, Timestamp, Transmitter, TxFailure};
 
 use core::time::Duration;
 use std::fmt::{Display, Formatter};
@@ -81,6 +82,9 @@ pub enum Error {
     ListenOnly,
     /// The channel stopped or the device went away.
     Stopped,
+    /// The device says the frame was not sent, and why (transmit
+    /// confirmation, ferrocan's).
+    TxFailed(TxFailure),
 }
 
 impl Display for Error {
@@ -96,6 +100,7 @@ impl Display for Error {
             Error::NotFd => write!(f, "an FD frame on a classic channel"),
             Error::ListenOnly => write!(f, "a frame to send on a listen-only channel"),
             Error::Stopped => write!(f, "the channel stopped"),
+            Error::TxFailed(failure) => write!(f, "the frame was not sent: {failure}"),
         }
     }
 }
@@ -341,8 +346,8 @@ impl GsUsb {
     }
 
     /// Starts `channel` with `settings` and returns its two halves; dropping
-    /// both stops it. The device's timestamps are asked for when it has
-    /// them.
+    /// both stops it. The device's timestamps, and its transmit confirmation
+    /// ([`feature::TX_CONFIRMATION`]), are asked for when it has them.
     ///
     /// # Errors
     ///
@@ -353,7 +358,7 @@ impl GsUsb {
     pub async fn start(&self, channel: u8, settings: &Settings) -> Result<(Transmitter, Receiver), Error> {
         let bt = self.bt_const(channel).await?;
         let has = |wanted: u32| bt.feature & wanted == wanted;
-        let mut flags = bt.feature & feature::HW_TIMESTAMP;
+        let mut flags = bt.feature & (feature::HW_TIMESTAMP | feature::TX_CONFIRMATION);
         for (asked, wanted) in [
             (settings.listen_only, feature::LISTEN_ONLY),
             (settings.loopback, feature::LOOP_BACK),
@@ -385,7 +390,7 @@ impl GsUsb {
         if let Some(data) = data {
             self.control_out(Request::DataBittiming, channel.into(), DeviceBittiming::encode(&data, &mut buf)).await?;
         }
-        let halves = channel::halves(&self.interface, self.number.into(), channel, (self.bulk_in, self.bulk_out), settings, flags & feature::HW_TIMESTAMP != 0)?;
+        let halves = channel::halves(&self.interface, self.number.into(), channel, (self.bulk_in, self.bulk_out), settings, flags)?;
         self.mode(channel, mode::START, flags).await?;
         Ok(halves)
     }

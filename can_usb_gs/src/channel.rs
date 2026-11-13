@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use can_hal::async_channel::{AsyncReceive, AsyncReceiveFd, AsyncTransmit, AsyncTransmitFd};
 use can_hal::{BusState, BusStatus, CanFdFrame, CanFrame, CanId, ErrorCounters, Frame, SamplePoint, Timestamped};
-use gs_usb_protocol::{ECHO_ID_RX, FD_TS_LEN, HostFrame, can_err, can_id, fd_len, frame_flag};
+use gs_usb_protocol::{ECHO_ID_RX, FD_TS_LEN, HostFrame, can_err, can_id, fd_len, feature, frame_flag, tx_failed};
 use nusb::transfer::{Buffer, Bulk, In, Out, TransferError};
 use nusb::{Endpoint, Interface, MaybeFuture};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
@@ -167,10 +167,51 @@ pub enum Event {
     Error(ErrorFrame),
 }
 
+/// Why a frame was not sent, as a device with transmit confirmation
+/// ([`feature::TX_CONFIRMATION`], ferrocan's) says on its echo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TxFailure {
+    /// Given up after a single-shot attempt failed.
+    GaveUp,
+    /// Dropped on going bus-off.
+    BusOff,
+    /// Aborted.
+    Aborted,
+    /// The controller's report was lost: it may have been sent.
+    Unconfirmed,
+    /// A reason this driver doesn't know.
+    Other(u8),
+}
+
+impl TxFailure {
+    fn from_code(code: u8) -> Self {
+        match code {
+            tx_failed::GAVE_UP => Self::GaveUp,
+            tx_failed::BUS_OFF => Self::BusOff,
+            tx_failed::ABORTED => Self::Aborted,
+            tx_failed::UNCONFIRMED => Self::Unconfirmed,
+            other => Self::Other(other),
+        }
+    }
+}
+
+impl std::fmt::Display for TxFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::GaveUp => write!(f, "given up after a single-shot attempt"),
+            Self::BusOff => write!(f, "dropped on going bus-off"),
+            Self::Aborted => write!(f, "aborted"),
+            Self::Unconfirmed => write!(f, "its report was lost; it may have been sent"),
+            Self::Other(code) => write!(f, "reason {code}"),
+        }
+    }
+}
+
 /// A frame sent and not yet echoed.
 struct Slot {
     _permit: OwnedSemaphorePermit,
-    done: oneshot::Sender<Timestamp>,
+    done: oneshot::Sender<Result<Timestamp, TxFailure>>,
 }
 
 /// What the reader, [`Transmitter`] and [`Receiver`] share.
@@ -181,16 +222,20 @@ struct Shared {
     slots: Mutex<Vec<Option<Slot>>>,
     dropped: AtomicU64,
     overflows: AtomicU64,
+    /// Whether the channel was started with transmit confirmation, so that
+    /// echoes say when a frame wasn't sent.
+    tx_confirmation: bool,
 }
 
 impl Shared {
-    fn new() -> Self {
+    fn new(tx_confirmation: bool) -> Self {
         Self {
             bus: Mutex::new((BusState::ErrorActive, ErrorCounters { transmit: 0, receive: 0 })),
             permits: Arc::new(Semaphore::new(ECHO_SLOTS)),
             slots: Mutex::new((0..ECHO_SLOTS).map(|_| None).collect()),
             dropped: AtomicU64::new(0),
             overflows: AtomicU64::new(0),
+            tx_confirmation,
         }
     }
 
@@ -239,11 +284,14 @@ pub struct Transmitter {
 
 /// A frame's echo, which resolves with the echo's [`Timestamp`].
 ///
-/// What the echo means is the firmware's choice. ferrocan echoes a frame
-/// once the controller reports it done, so the timestamp is its time on the
-/// bus (or when it was given up, after bus-off). candleLight echoes as soon as
-/// the frame is queued in the controller, so the timestamp is the time it was
-/// queued, and a frame lost after that (on bus-off, say) is still confirmed.
+/// What the echo means is the firmware's choice. A device with transmit
+/// confirmation ([`feature::TX_CONFIRMATION`], ferrocan's; see
+/// [`Transmitter::confirms_transmission`]) echoes a frame once the controller
+/// reports it done: the timestamp is its time on the bus, and a frame not
+/// sent resolves to [`Error::TxFailed`] with the reason. candleLight echoes
+/// as soon as the frame is queued in the controller, so the timestamp is the
+/// time it was queued, and a frame lost after that (on bus-off, say) is
+/// still confirmed.
 ///
 /// Until it is echoed the frame holds one of the [`ECHO_SLOTS`]. A frame that
 /// can't get onto the bus (no other node acknowledges it, or it keeps losing
@@ -252,17 +300,30 @@ pub struct Transmitter {
 /// request to take back one frame; only a mode reset (stopping the channel)
 /// drops them, all at once.
 #[must_use = "a confirmation does nothing unless awaited"]
-pub struct Confirmation(oneshot::Receiver<Timestamp>);
+pub struct Confirmation(oneshot::Receiver<Result<Timestamp, TxFailure>>);
 
 impl Future for Confirmation {
     type Output = Result<Timestamp, Error>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        Pin::new(&mut self.0).poll(cx).map(|result| result.map_err(|_| Error::Stopped))
+        Pin::new(&mut self.0).poll(cx).map(|result| match result {
+            Ok(Ok(timestamp)) => Ok(timestamp),
+            Ok(Err(failure)) => Err(Error::TxFailed(failure)),
+            Err(_) => Err(Error::Stopped),
+        })
     }
 }
 
 impl Transmitter {
+    /// Whether the device confirms transmissions
+    /// ([`feature::TX_CONFIRMATION`]): a [`Confirmation`] then means the
+    /// frame was acknowledged on the bus, and a frame not sent fails with
+    /// [`Error::TxFailed`]. Otherwise it may only mean the frame was queued.
+    #[must_use]
+    pub fn confirms_transmission(&self) -> bool {
+        self.shared.tx_confirmation
+    }
+
     /// Sends `frame`, waiting while [`ECHO_SLOTS`] frames are unconfirmed
     /// and then for the device to take it. Await the [`Confirmation`] for
     /// its echo, or drop it.
@@ -336,10 +397,11 @@ impl Receiver {
 
 /// Opens the endpoints, starts the reader and returns the two halves; the
 /// caller then starts the channel.
-pub(crate) fn halves(interface: &Interface, index: u16, channel: u8, endpoints: (u8, u8), settings: &Settings, timestamped: bool) -> Result<(Transmitter, Receiver), Error> {
+pub(crate) fn halves(interface: &Interface, index: u16, channel: u8, endpoints: (u8, u8), settings: &Settings, flags: u32) -> Result<(Transmitter, Receiver), Error> {
+    let timestamped = flags & feature::HW_TIMESTAMP != 0;
     let bulk_in = interface.endpoint::<Bulk, In>(endpoints.0)?;
     let out = interface.endpoint::<Bulk, Out>(endpoints.1)?;
-    let shared = Arc::new(Shared::new());
+    let shared = Arc::new(Shared::new(flags & feature::TX_CONFIRMATION != 0));
     let (events, receiver) = mpsc::channel(RECEIVE_QUEUE_LEN);
     let reader = tokio::spawn(read(bulk_in, events, shared.clone(), channel, timestamped));
     let guard = Arc::new(Guard {
@@ -466,8 +528,13 @@ fn handle(host: &HostFrame, timestamp: Timestamp, shared: &Shared) -> Option<Eve
     if host.echo_id != ECHO_ID_RX {
         let slot = usize::try_from(host.echo_id).ok().and_then(|index| shared.slots.lock().unwrap_or_else(PoisonError::into_inner).get_mut(index)?.take());
         if let Some(slot) = slot {
+            let outcome = if shared.tx_confirmation && host.flags & frame_flag::TX_FAILED != 0 {
+                Err(TxFailure::from_code(host.data[0]))
+            } else {
+                Ok(timestamp)
+            };
             // The sender may have dropped its confirmation.
-            let _ = slot.done.send(timestamp);
+            let _ = slot.done.send(outcome);
         } else {
             debug!("gs_usb: echo {} with nothing sent", host.echo_id);
         }
@@ -633,7 +700,7 @@ mod tests {
     use super::*;
 
     fn shared() -> Shared {
-        Shared::new()
+        Shared::new(true)
     }
 
     fn stamp() -> Timestamp {
@@ -676,6 +743,25 @@ mod tests {
         assert_eq!(permits.available_permits(), 1);
         // An unknown echo is ignored.
         assert!(handle(&echo, stamp(), &shared).is_none());
+    }
+
+    #[test]
+    fn failed_echoes_say_why_with_tx_confirmation() {
+        for (confirming, expected) in [(true, Err(TxFailure::BusOff)), (false, Ok(()))] {
+            let shared = Shared::new(confirming);
+            let (done, mut confirmation) = oneshot::channel();
+            shared.slots.lock().unwrap()[1] = Some(Slot {
+                _permit: shared.permits.clone().try_acquire_owned().unwrap(),
+                done,
+            });
+            let frame = Frame::Can(CanFrame::new(CanId::new_standard(1).unwrap(), &[0x55]).unwrap());
+            let mut echo = to_host(&frame, 1, 0);
+            echo.flags |= frame_flag::TX_FAILED;
+            echo.data[0] = tx_failed::BUS_OFF;
+            assert!(handle(&echo, stamp(), &shared).is_none());
+            assert_eq!(confirmation.try_recv().unwrap().map(drop), expected, "TX confirmation {confirming}");
+        }
+        assert_eq!(TxFailure::from_code(9), TxFailure::Other(9));
     }
 
     #[test]
