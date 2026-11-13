@@ -3,13 +3,17 @@
 //  SPDX-License-Identifier: Apache-2.0
 
 //! Starts the first `gs_usb` device that opens (others may be in use; with
-//! `--fd`, the first with CAN FD), sends some frames, waiting for each one's
-//! echo, and prints what it receives, error frames decoded.
+//! `--fd`, the first with CAN FD; with `--serial`, the one with that USB
+//! serial number), sends some frames, waiting for each one's echo, and
+//! prints what it receives, error frames decoded.
 //!
 //! ```text
-//! cargo run --example bus -- [--bitrate 250000] [--count 10] [--listen 5]
-//!     [--fd <data bitrate>] [--one-shot] [--listen-only] [--bus-errors]
+//! cargo run --example bus -- [--serial <serial number>] [--bitrate 250000]
+//!     [--count 10] [--listen 5] [--fd <data bitrate>] [--one-shot]
+//!     [--listen-only] [--bus-errors]
 //! ```
+//!
+//! `--help` describes each option.
 //!
 //! Frames are standard ID 0x123 with a counter in the data, sampled at 87.5%.
 //! With `--fd` (the data phase sampled at 75%, as Linux does above
@@ -21,45 +25,39 @@ use std::time::Duration;
 use can_hal::{BusStatus, CanFdFrame, CanFrame, CanId, Frame, SamplePoint};
 use can_usb_gs::protocol::{can_err, feature};
 use can_usb_gs::{ErrorFrame, Event, GsUsb, Receiver, Settings, list_devices};
+use clap::Parser;
 
 /// The FD data lengths, one per DLC.
 const FD_LENGTHS: [usize; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 20, 24, 32, 48, 64];
 
+/// Sends frames on a `gs_usb` device, waiting for each one's echo, and
+/// prints what it receives, error frames decoded.
+#[derive(Parser)]
 struct Options {
+    /// The device with this USB serial number (default: the first that opens).
+    #[arg(long)]
+    serial: Option<String>,
+    /// The nominal bit rate, in bit/s.
+    #[arg(long, default_value_t = 250_000)]
     bitrate: u32,
+    /// How many frames to send.
+    #[arg(long, default_value_t = 10)]
     count: u32,
+    /// How long to go on receiving after the frames are sent, in seconds.
+    #[arg(long, default_value_t = 5)]
     listen: u64,
+    /// CAN FD with bit rate switching, with this data bit rate, in bit/s.
+    #[arg(long = "fd", value_name = "DATA_BITRATE")]
     data_bitrate: Option<u32>,
+    /// Send each frame once, not again after a failure.
+    #[arg(long)]
     one_shot: bool,
+    /// Only listen: send nothing, acknowledge nothing.
+    #[arg(long)]
     listen_only: bool,
+    /// Report each bus error as an error frame.
+    #[arg(long)]
     bus_errors: bool,
-}
-
-fn options() -> Options {
-    let mut options = Options {
-        bitrate: 250_000,
-        count: 10,
-        listen: 5,
-        data_bitrate: None,
-        one_shot: false,
-        listen_only: false,
-        bus_errors: false,
-    };
-    let mut args = std::env::args().skip(1);
-    while let Some(arg) = args.next() {
-        let mut number = || args.next().and_then(|value| value.parse::<u32>().ok()).unwrap_or_else(|| panic!("{arg} needs a number"));
-        match arg.as_str() {
-            "--bitrate" => options.bitrate = number(),
-            "--count" => options.count = number(),
-            "--listen" => options.listen = number().into(),
-            "--fd" => options.data_bitrate = Some(number()),
-            "--one-shot" => options.one_shot = true,
-            "--listen-only" => options.listen_only = true,
-            "--bus-errors" => options.bus_errors = true,
-            _ => panic!("unknown option {arg}"),
-        }
-    }
-    options
 }
 
 /// An error frame in words, as Linux's `candump -e` would put it.
@@ -146,9 +144,12 @@ async fn receive(mut rx: Receiver, listen: u64) -> Receiver {
 
 #[tokio::main]
 async fn main() -> Result<(), can_usb_gs::Error> {
-    let options = options();
+    let options = Options::parse();
     let mut device = None;
     for info in list_devices().await? {
+        if options.serial.as_deref().is_some_and(|wanted| info.serial_number() != Some(wanted)) {
+            continue;
+        }
         let name = info.to_string();
         match GsUsb::open(info).await {
             Ok(opened) if options.data_bitrate.is_some() && opened.bt_const(0).await?.feature & feature::FD == 0 => println!("{name}: no CAN FD"),
@@ -160,7 +161,10 @@ async fn main() -> Result<(), can_usb_gs::Error> {
             Err(e) => println!("{name}: {e}"),
         }
     }
-    let device = device.expect("no gs_usb device could be opened");
+    let device = device.unwrap_or_else(|| match &options.serial {
+        Some(serial) => panic!("no gs_usb device with serial number {serial} could be opened"),
+        None => panic!("no gs_usb device could be opened"),
+    });
     let mut settings = Settings::new(options.bitrate).with_sample_point(SamplePoint::PCT_87_5);
     if let Some(data_bitrate) = options.data_bitrate {
         settings = settings.with_data_sample_point(data_bitrate, SamplePoint::PCT_75);
