@@ -775,6 +775,24 @@ mod tests {
     }
 
     #[test]
+    fn a_zero_length_fd_echo_keeps_its_reason() {
+        let shared = Shared::new(true);
+        let (done, mut confirmation) = oneshot::channel();
+        shared.slots.lock().unwrap()[0] = Some(Slot {
+            _permit: shared.permits.clone().try_acquire_owned().unwrap(),
+            done,
+        });
+        let frame = Frame::Fd(CanFdFrame::new(CanId::new_standard(1).unwrap(), &[], true, false).unwrap());
+        let mut echo = to_host(&frame, 0, 0);
+        echo.flags |= frame_flag::TX_FAILED;
+        echo.data[0] = tx_failed::GAVE_UP;
+        let mut wire = [0; FD_TS_LEN];
+        let decoded = HostFrame::decode_in(echo.encode(&mut wire), false).unwrap();
+        assert!(handle(&decoded, stamp(), &shared).is_none());
+        assert_eq!(confirmation.try_recv().unwrap().map(drop), Err(TxFailure::GaveUp));
+    }
+
+    #[test]
     fn stopping_fails_what_waits() {
         let shared = shared();
         let (done, mut confirmation) = oneshot::channel();

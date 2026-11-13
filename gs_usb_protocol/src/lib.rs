@@ -594,8 +594,11 @@ pub struct HostFrame {
     pub channel: u8,
     /// [`frame_flag`]s.
     pub flags: u8,
-    /// The data; bytes past the DLC's length are zero. A classic frame uses
-    /// the first eight.
+    /// The data. A classic frame uses the first eight. From
+    /// [`decode`](Self::decode), bytes past the DLC's length are zero; from
+    /// [`decode_in`](Self::decode_in), they are as the device sent them, as
+    /// an echo flagged [`frame_flag::TX_FAILED`] carries its reason in the
+    /// first, whatever its DLC.
     pub data: [u8; 64],
     /// Microseconds on the device's timer, when [`feature::HW_TIMESTAMP`]
     /// was asked for (IN only).
@@ -642,8 +645,8 @@ impl HostFrame {
     /// echo of one the host sent. A classic frame needs [`CLASSIC_LEN`] bytes
     /// and an FD frame [`FD_LEN`], four more each when `timestamped` (the
     /// channel was started with [`feature::HW_TIMESTAMP`]); the timestamp
-    /// follows all eight or 64 data bytes, whatever the DLC. Any bytes beyond
-    /// are ignored, as padding to the packet size
+    /// follows all eight or 64 data bytes, whatever the DLC, and all of them
+    /// are kept. Any bytes beyond are ignored, as padding to the packet size
     /// ([`feature::PAD_PKTS_TO_MAX_PKT_SIZE`]) adds.
     ///
     /// # Errors
@@ -652,10 +655,9 @@ impl HostFrame {
     /// DLC over 15.
     pub fn decode_in(bytes: &[u8], timestamped: bool) -> Result<Self, DecodeError> {
         let mut frame = Self::decode(bytes)?;
-        let end = HEADER_LEN + if frame.is_fd() { 64 } else { 8 };
-        if bytes.len() < end {
-            return Err(DecodeError::Short);
-        }
+        let data_len = if frame.is_fd() { 64 } else { 8 };
+        let end = HEADER_LEN + data_len;
+        frame.data[..data_len].copy_from_slice(bytes.get(HEADER_LEN..end).ok_or(DecodeError::Short)?);
         if timestamped {
             frame.timestamp_us = Some(u32_at(bytes.get(end..).ok_or(DecodeError::Short)?, 0)?);
         }
@@ -692,6 +694,26 @@ mod tests {
         assert_eq!(Request::from_u8(4), Some(Request::BtConst));
         assert_eq!(Request::from_u8(14), Some(Request::GetState));
         assert_eq!(Request::from_u8(15), None);
+    }
+
+    #[test]
+    fn in_frames_keep_every_data_byte() {
+        // A zero-length FD echo flagged TX_FAILED, its reason in data[0].
+        let mut echo = HostFrame {
+            echo_id: 2,
+            can_id: 0x123,
+            can_dlc: 0,
+            channel: 0,
+            flags: frame_flag::FD | frame_flag::TX_FAILED,
+            data: [0; 64],
+            timestamp_us: Some(7),
+        };
+        echo.data[0] = tx_failed::GAVE_UP;
+        let mut out = [0; FD_TS_LEN];
+        let decoded = HostFrame::decode_in(echo.encode(&mut out), true).unwrap();
+        assert_eq!(decoded, echo);
+        // What the host sent loses the bytes past its DLC.
+        assert_eq!(HostFrame::decode(echo.encode(&mut out)).unwrap().data[0], 0);
     }
 
     #[test]
